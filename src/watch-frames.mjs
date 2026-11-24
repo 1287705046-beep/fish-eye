@@ -44,6 +44,21 @@ const cols = Math.max(1, Math.min(4, Number(arg('cols', 2)) || 2));           //
 const rows = Math.max(1, Math.min(4, Number(arg('rows', 2)) || 2));           // 每张几行
 const perGrid = cols * rows;
 const maxGrids = Math.max(0, Math.min(40, Number(arg('max-grids', TUNING.maxGrids)) || TUNING.maxGrids));
+
+// ── 字幕条漫（2026-11-24，技术顾问的方案）─────────────────────────────────
+// 问题：B站 大量视频的字幕是**烧在画面里**的，没有 DOM、接口也拿不到。
+// 只靠"整帧变化"留帧，撞上字幕纯看运气（实测 40 秒 6 格只撞到 1~2 格）。
+//
+// 做法：画面主体照旧拼宫格（看剧情），**字幕另开一条线**——
+// 每隔 --sub-strip 秒裁下画面底部那一条，变了才收，攒够 --sub-per-sheet 条
+// 竖直拼成一张"条漫"。这样一段的台词是连续的，不用靠宫格运气撞。
+//
+// 为什么不做"字幕检测"再补帧：实测白像素占比中位只有 0.2%、最高 4.7%，
+// 字幕是半透明白加描边，阈值定哪都不稳；而"底部这一条变了"是稳的信号。
+//   --sub-strip 0 关掉这项
+const subStripSec = Math.max(0, Math.min(10, Number(arg('sub-strip', 1.5)) || 0));
+const subPerSheet = Math.max(2, Math.min(30, Number(arg('sub-per-sheet', 16)) || 16));
+const subMaxSheets = Math.max(0, Math.min(20, Number(arg('sub-max-sheets', 4)) || 4));
 const wantBv = String(arg('bv', '') || '');
 const asJson = process.argv.includes('--json');
 
@@ -91,13 +106,18 @@ class Cdp {
 }
 
 // 页面里的扫描器：缩略图打分 → 决定留不留 → 留就画进 3×2 的格子；满一张交回来，node 立刻落盘。
-const PAGE_HELPERS = (cols, perGrid, cellW, cellH) => `(() => {
+const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subStripMs, subPerSheet) => `(() => {
   if (window.__biliEye && window.__biliEye.ok) return { ok: true, reused: true };
   const COLS = ${cols}, PER = ${perGrid}, CW = ${cellW}, CH = ${cellH};
-  const state = { ok: true, prevLum: null, lastT: -99, lastKeepAt: 0, cur: null };
+  const SUB_GAP = ${subStripMs}, SUB_PER = ${subPerSheet};
+  const state = { ok: true, prevLum: null, prevSub: null, lastT: -99, lastKeepAt: 0, subKeeps: 0, sheet: null, cur: null };
   const probe = document.createElement('canvas');
   probe.width = 32; probe.height = 18;
   state.probeCtx = probe.getContext('2d', { willReadFrequently: true });
+  // 字幕带：只用来判断"变了没"，不判断"有没有字"
+  const subProbe = document.createElement('canvas');
+  subProbe.width = 64; subProbe.height = 16;
+  state.subCtx = subProbe.getContext('2d', { willReadFrequently: true });
 
   // 音量：接管 video 的音频输出，读实时频谱。跨域没被静音（实测 2026-11-23），
   // 但万一被静音（ctx 挂起/报错），就退回不分析音量，画面照抓。
@@ -158,6 +178,52 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH) => `(() => {
     state.cur = { canvas: g, ctx: c, n: 0, times: [] };
   };
   state.reset();
+  // ── 字幕条：底部那一条单独裁下来，竖直拼成"条漫" ────────────────────────
+  // 宽固定 960（再窄字就糊了），每条高按 16:9 源算出来约 77px，10 条一张 ≈ 960×770。
+  const STRIP_W = 960;
+  state.lastStripAt = 0;
+  state.pushStrip = (v, t) => {
+    const srcX = Math.round(v.videoWidth * 0.08);
+    const srcW = Math.max(1, Math.round(v.videoWidth * 0.84));
+    const srcY = Math.round(v.videoHeight * 0.82);
+    const srcH = Math.max(1, Math.round(v.videoHeight * 0.12));
+    const stripH = Math.max(24, Math.round(STRIP_W * srcH / srcW));
+    if (!state.sheet) {
+      const c = document.createElement('canvas');
+      c.width = STRIP_W;
+      c.height = stripH * SUB_PER;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, c.width, c.height);
+      state.sheet = { canvas: c, ctx, n: 0, times: [], stripH };
+    }
+    const sheet = state.sheet;
+    const y = sheet.n * sheet.stripH;
+    sheet.ctx.drawImage(v, srcX, srcY, srcW, srcH, 0, y, STRIP_W, sheet.stripH);
+    const label = String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(Math.floor(t % 60)).padStart(2, '0');
+    sheet.ctx.font = 'bold 20px "Microsoft YaHei", sans-serif';
+    const tw = sheet.ctx.measureText(label).width;
+    sheet.ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    sheet.ctx.fillRect(0, y, tw + 12, 26);
+    sheet.ctx.fillStyle = '#9fe3ff';
+    sheet.ctx.fillText(label, 6, y + 20);
+    sheet.n += 1;
+    sheet.times.push(t);
+    state.subKeeps += 1;
+    if (sheet.n >= SUB_PER) {
+      const done = { url: sheet.canvas.toDataURL('image/jpeg', 0.8), times: sheet.times.slice(), w: sheet.canvas.width, h: sheet.canvas.height };
+      state.sheet = null;
+      return done;
+    }
+    return null;
+  };
+  state.tailSheet = () => {
+    if (!state.sheet || state.sheet.n <= 0) return null;
+    const sheet = state.sheet;
+    const r = { url: sheet.canvas.toDataURL('image/jpeg', 0.8), times: sheet.times.slice(), w: sheet.canvas.width, h: sheet.canvas.height, partial: true };
+    state.sheet = null;
+    return r;
+  };
   state.info = () => {
     const v = document.querySelector('video');
     const m = location.href.match(/\\/video\\/(BV[0-9A-Za-z]{10})/);
@@ -200,6 +266,31 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH) => `(() => {
     const first = !state.prevLum;
     state.prevLum = lum;
 
+    // ①b 字幕条：每 SUB_GAP 毫秒看一眼底部，这条带子"动了"就裁一条进条漫。
+    //     不判断"有没有字"——半透明白加描边，白像素占比上限才 4.7%，判不出来；
+    //     而"变没变"是稳的（实测静止时中位 0.x，字幕换句时十几到几十）。
+    let subDiff = 0, sheetOut = null;
+    const now = Date.now();
+    if (SUB_GAP > 0) {
+      const sy = Math.round(v.videoHeight * 0.70);
+      const sh = Math.max(1, Math.round(v.videoHeight * 0.26));
+      const sc = state.subCtx;
+      sc.drawImage(v, 0, sy, v.videoWidth, sh, 0, 0, 64, 16);
+      const sd = sc.getImageData(0, 0, 64, 16).data;
+      const sn = 64 * 16;
+      const sub = new Float32Array(sn);
+      for (let i = 0, j = 0; i < sd.length; i += 4, j++) sub[j] = sd[i] * 0.299 + sd[i + 1] * 0.587 + sd[i + 2] * 0.114;
+      if (state.prevSub) {
+        for (let k = 0; k < sn; k++) subDiff += Math.abs(sub[k] - state.prevSub[k]);
+        subDiff /= sn;
+      }
+      state.prevSub = sub;
+      if ((now - state.lastStripAt) >= SUB_GAP && subDiff >= 2) {
+        state.lastStripAt = now;
+        sheetOut = state.pushStrip(v, t);
+      }
+    }
+
     // 纯色转场（白屏/黑屏/闪白）：标准差太小，画面里没有信息，别占格子
     let mL = 0;
     for (let k = 0; k < n; k++) mL += lum[k];
@@ -216,14 +307,14 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH) => `(() => {
     //   - 单帧变化够大 = 换镜头/动作，立刻留
     //   - 或者刚响了一下 = 事件点，留
     //   - 否则按时间兜底；但画面几乎完全没动时，兜底时间拉长 6 倍，别把同一片树叶拍六遍
-    const now = Date.now();
     const nearlyStill = diff < 0.3;
     const forceAfter = forceGapMs * (nearlyStill ? 3 : 1);  // 完全不动（<0.3）= 20×3 = 60 秒才留一张
     const forced = (now - state.lastKeepAt) >= forceAfter;
     const tooSoon = state.lastKeepAt > 0 && (now - state.lastKeepAt) < minGapMs;
     // 音量只记录、不抓帧：一声爆炸不该多塞一张图，看片的人会被莫名叫醒
-    const keep = first || (!tooSoon && !flat && (diff >= threshold || forced));
-    if (!keep) return { t, diff: +diff.toFixed(2), kept: false, flat, spike: loud ? loud.spike : 0, paused: v.paused, ended: v.ended };
+    const keepCut = first || (!tooSoon && !flat && (diff >= threshold || forced));
+    const keep = keepCut;
+    if (!keep) return { t, diff: +diff.toFixed(2), subDiff: +subDiff.toFixed(1), kept: false, flat, subSheet: sheetOut, spike: loud ? loud.spike : 0, paused: v.paused, ended: v.ended };
     state.lastKeepAt = now;
 
     // ③ 画进格子
@@ -242,7 +333,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH) => `(() => {
     state.cur.n += 1;
     state.cur.times.push(t);
 
-    const out = { t, diff: +diff.toFixed(2), kept: true, cut: diff >= threshold, forced, loudHit, spike: loud ? loud.spike : 0, paused: v.paused, ended: v.ended };
+    const out = { t, diff: +diff.toFixed(2), subDiff: +subDiff.toFixed(1), kept: true, cut: diff >= threshold, forced, loudHit, subSheet: sheetOut, spike: loud ? loud.spike : 0, paused: v.paused, ended: v.ended };
     if (state.cur.n >= PER) {
       out.grid = canvas.toDataURL('image/jpeg', 0.85);
       out.times6 = state.cur.times.slice();
@@ -288,12 +379,24 @@ function saveGrid(dir, bv, tag, url, times, partial) {
   }
 }
 
+/** 字幕条漫落盘。和宫格分开命名（sub-*），一眼能分清哪张是画面、哪张是台词。 */
+function saveSubSheet(dir, bv, tag, sheet) {
+  try {
+    const file = path.join(dir, `sub-${bv}-${tag}-${Date.now()}.jpg`);
+    fs.writeFileSync(file, Buffer.from(String(sheet.url).split(',')[1], 'base64'));
+    return { file, w: sheet.w, h: sheet.h, times: sheet.times, partial: !!sheet.partial };
+  } catch (e) {
+    log(`写字幕条漫失败：${e?.message ?? e}`);
+    return null;
+  }
+}
+
 (async () => {
   const startedAt = Date.now();
-  const helpers = PAGE_HELPERS(cols, perGrid, CELL_W, CELL_H);
+  const helpers = PAGE_HELPERS(cols, perGrid, CELL_W, CELL_H, Math.round(subStripSec * 1000), subPerSheet);
   const result = {
     ok: false, bv: '', from: 0, to: 0, ended: false,
-    scanned: 0, kept: 0, frames: 0, grids: [], note: '',
+    scanned: 0, kept: 0, frames: 0, grids: [], subSheets: [], note: '',
   };
 
   let c = null;
@@ -328,7 +431,7 @@ function saveGrid(dir, bv, tag, url, times, partial) {
   const deadline = startedAt + seconds * 1000;
   const forceGapMs = forceGapSec * 1000;
   let fails = 0, skips = 0, pausedSince = 0;
-  let cuts = 0, forces = 0, maxSpike = 0;
+  let cuts = 0, forces = 0, subs = 0, maxSpike = 0;
   const loudTimes = [];
 
   while (Date.now() < deadline) {
@@ -366,12 +469,21 @@ function saveGrid(dir, bv, tag, url, times, partial) {
         result.kept += 1;
         result.frames += 1;
         if (g.value.cut) cuts += 1;
-        if (g.value.forced) forces += 1;
+        else if (g.value.forced) forces += 1;
       }
       if (g.value.grid) {
         const saved = saveGrid(dir, result.bv, String(result.frames).padStart(3, '0'), g.value.grid, g.value.times6, false);
         if (saved) result.grids.push(saved);
         if (maxGrids > 0 && result.grids.length >= maxGrids) break;
+      }
+      if (g.value.subSheet) {
+        const saved = saveSubSheet(dir, result.bv, String(result.subSheets.length + 1).padStart(3, '0'), g.value.subSheet);
+        if (saved) result.subSheets.push(saved);
+        // 条漫满了就把这段交了：再攒下去图太多，一条消息装不下
+        if (subMaxSheets > 0 && result.subSheets.length >= subMaxSheets) {
+          result.note = `字幕条漫攒够 ${subMaxSheets} 张，先把这段交给你（画面 ${result.grids.length} 张）`;
+          break;
+        }
       }
       if (g.value.ended) { result.ended = true; break; }
     }
@@ -386,17 +498,26 @@ function saveGrid(dir, bv, tag, url, times, partial) {
     const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true);
     if (saved) result.grids.push(saved);
   }
+  // 没攒满的那一张条漫也要交，不然最后几句台词就丢了
+  const tailSheet = await c.eval('window.__biliEye && window.__biliEye.tailSheet ? window.__biliEye.tailSheet() : null', 20000);
+  if (!tailSheet.err && tailSheet.value?.url && (tailSheet.value.times || []).length >= 2) {
+    const saved = saveSubSheet(dir, result.bv, 'tail', tailSheet.value);
+    if (saved) result.subSheets.push(saved);
+  }
   await c.eval('try { if (window.__biliEye) window.__biliEye.ok = false } catch (e) {}', 3000);
   c.close();
 
   result.ok = result.frames > 0 && result.grids.length > 0;
   result.cuts = cuts;
   result.forces = forces;
+  result.subs = result.subSheets.reduce((sum, s) => sum + (s.times || []).length, 0);
+  result.subStripSec = subStripSec;
   result.loud = loudTimes.slice(0, 30);
   result.maxSpike = +maxSpike.toFixed(2);
   if (!result.note) {
+    const subNote = result.subSheets.length ? `，字幕条漫 ${result.subSheets.length} 张（${result.subs} 条）` : '';
     result.note = result.ok
-      ? `扫了 ${result.scanned} 次，留 ${result.frames} 个画面（换镜头 ${cuts}、兜底 ${forces}），拼成 ${result.grids.length} 张`
+      ? `扫了 ${result.scanned} 次，留 ${result.frames} 个画面（换镜头 ${cuts}、兜底 ${forces}${subNote}），拼成 ${result.grids.length} 张`
       : '一个画面都没留';
   }
   log(`${result.bv} ${result.from}→${result.to}s 扫${result.scanned} 留${result.frames} 格${result.grids.length} ${result.ended ? '播完' : '到点'}`);
@@ -409,6 +530,10 @@ function emit(r) {
   for (const g of r.grids) {
     const ts = (g.times || []).map((t) => `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(Math.floor(t % 60)).padStart(2, '0')}`).join(' ');
     console.log(`  ${g.file}  ${ts}`);
+  }
+  for (const s of r.subSheets || []) {
+    const ts = (s.times || []).map((t) => `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(Math.floor(t % 60)).padStart(2, '0')}`).join(' ');
+    console.log(`  [字幕] ${s.file}  ${s.w}x${s.h}  ${ts}`);
   }
   if (!r.ok && r.note) process.exitCode = 1;
 }
