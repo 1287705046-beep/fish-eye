@@ -1,0 +1,25 @@
+{
+  "name": "bili-watch-frames",
+  "version": "0.1.0",
+  "description": "让模型陪你一起看视频：在已经打开的浏览器里按画面变化抓帧（B站 是第一个适配器）",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "watch": "node src/watch-frames.mjs",
+    "guard": "node src/player-guard.mjs",
+    "replay": "node src/replay.mjs",
+    "test": "node --check src/watch-frames.mjs && node --check src/player-guard.mjs && node --check src/replay.mjs && node --check src/subtitle-guard.js"
+  },
+  "keywords": [
+    "llm",
+    "video",
+    "bilibili",
+    "cdp",
+    "screenshot",
+    "frames",
+    "multimodal"
+  ]
+}
