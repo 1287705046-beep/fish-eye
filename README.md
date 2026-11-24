@@ -156,7 +156,7 @@ docs/
 
 Fish-eye began with a simple complaint:
 
-> "I can't see clearly enough. If you make the images sharper, it gets too expensive."
+> "I can't see clearly enough. Just a little clearer would help."
 
 So I built a new pair of eyes.
 
