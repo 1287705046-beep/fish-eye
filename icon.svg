@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Fish eye">
+  <defs>
+    <radialGradient id="fe-iris" cx="42%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#8fe3ff"/>
+      <stop offset="55%" stop-color="#2f8fd6"/>
+      <stop offset="100%" stop-color="#123a5c"/>
+    </radialGradient>
+  </defs>
+  <circle cx="32" cy="32" r="29" fill="#0d1720"/>
+  <circle cx="32" cy="32" r="23" fill="url(#fe-iris)"/>
+  <circle cx="32" cy="32" r="9" fill="#061019"/>
+  <circle cx="26.5" cy="26" r="4.2" fill="#f2fbff" opacity="0.92"/>
+  <path d="M9 20c7-6 14-9 23-9" stroke="#bff0ff" stroke-width="2" stroke-linecap="round" fill="none" opacity="0.5"/>
+</svg>

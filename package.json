@@ -1,5 +1,5 @@
 {
-  "name": "bili-watch-frames",
+  "name": "fish-eye",
   "version": "0.1.0",
   "description": "让模型陪你一起看视频：在已经打开的浏览器里按画面变化抓帧（B站 是第一个适配器）",
   "type": "module",
@@ -7,11 +7,38 @@
   "engines": {
     "node": ">=22"
   },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "src",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
   "scripts": {
     "watch": "node src/watch-frames.mjs",
     "guard": "node src/player-guard.mjs",
     "replay": "node src/replay.mjs",
-    "test": "node --check src/watch-frames.mjs && node --check src/player-guard.mjs && node --check src/replay.mjs && node --check src/subtitle-guard.js"
+    "test": "node --check index.js && node --check client.js && node --check src/tuning.mjs && node --check src/watch-frames.mjs && node --check src/player-guard.mjs && node --check src/replay.mjs && node --check src/subtitle-guard.js && node scripts/test-tuning.mjs"
   },
   "keywords": [
     "llm",
@@ -20,6 +47,7 @@
     "cdp",
     "screenshot",
     "frames",
-    "multimodal"
+    "multimodal",
+    "dsh-plugin"
   ]
 }

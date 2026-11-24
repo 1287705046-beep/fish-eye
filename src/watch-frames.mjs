@@ -7,13 +7,18 @@
 // 3) 攒满 4 格（默认 2×2）立刻交回 node 落盘——页面被导航清掉也不丢。
 // 4) 跑满 seconds（默认 300）、攒满 max-grids（默认 8）或播完就收尾，返回每张图的路径和每格的秒数。
 //
-// 用法：node src/watch-frames.mjs [--seconds 300] [--th 10] [--scan 0.5] [--force-gap 20]
-//                                [--cols 2] [--rows 2] [--max-grids 8] [--bv BVxxx] [--json]
-// 环境变量：BILI_CDP_PORT（默认 9333）、BILI_FRAME_DIR（默认 ~/.cache/bili-watch-frames）、BILI_WATCH_LOG
+// 用法：node src/watch-frames.mjs [--seconds 300] [--th 20] [--scan 0.5] [--force-gap 20]
+//                                [--cols 2] [--rows 2] [--max-grids 20] [--bv BVxxx] [--json]
+// 环境变量：BILI_CDP_PORT（默认 9333）、BILI_FRAME_DIR（默认 ~/.cache/bili-watch-frames）、BILI_WATCH_LOG、
+//          FISH_EYE_TUNING（参数文件，默认 ~/.dsh/see-now/watch-tuning.json）
+//
+// th / scan / force-gap / max-grids 不给就用参数文件里的值 —— 那正是设置页「陪看」调的四个数。
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { readTuning } from './tuning.mjs';
 
+const TUNING = readTuning();
 const PORT = Number(process.env.BILI_CDP_PORT) || 9333;
 const HOME = os.homedir();
 const FRAME_ROOT = process.env.BILI_FRAME_DIR || path.join(HOME, '.cache', 'bili-watch-frames');
@@ -28,15 +33,17 @@ function arg(name, dflt) {
 }
 
 const seconds = Math.max(10, Math.min(900, Number(arg('seconds', 300)) || 300));
-const th = Math.max(1, Math.min(120, Number(arg('th', 10)) || 10));          // 变化阈值（亮度平均绝对差 0-255）
-const scanSec = Math.max(0.2, Math.min(3, Number(arg('scan', 0.5)) || 0.5)); // 扫描间隔
-const forceGapSec = Math.max(1, Math.min(120, Number(arg('force-gap', 20)) || 20)); // 兜底最长间隔（20 秒；EVA 那种 30 秒定格也留得下）
+// 下面四项的默认值来自参数文件（设置页「陪看」分区 / 播放器左侧面板改的就是它）。
+// 命令行显式给了就用命令行的 —— 脚本永远听调用方的。
+const th = Math.max(1, Math.min(120, Number(arg('th', TUNING.th)) || TUNING.th));          // 变化阈值（亮度平均绝对差 0-255）
+const scanSec = Math.max(0.2, Math.min(3, Number(arg('scan', TUNING.scan)) || TUNING.scan)); // 扫描间隔
+const forceGapSec = Math.max(1, Math.min(120, Number(arg('force-gap', TUNING.forceGap)) || TUNING.forceGap)); // 兜底最长间隔
 const loudSpike = Math.max(1.1, Math.min(10, Number(arg('loud-spike', 1.8)) || 1.8)); // 音量比基线高多少倍算'响了'
 const minGapMs = Math.max(0, Math.min(30, Number(arg('min-gap', 3)) || 3)) * 1000; // 两次留帧至少隔多久
 const cols = Math.max(1, Math.min(4, Number(arg('cols', 2)) || 2));           // 每张几列
 const rows = Math.max(1, Math.min(4, Number(arg('rows', 2)) || 2));           // 每张几行
 const perGrid = cols * rows;
-const maxGrids = Math.max(0, Math.min(40, Number(arg('max-grids', 8)) || 8));
+const maxGrids = Math.max(0, Math.min(40, Number(arg('max-grids', TUNING.maxGrids)) || TUNING.maxGrids));
 const wantBv = String(arg('bv', '') || '');
 const asJson = process.argv.includes('--json');
 

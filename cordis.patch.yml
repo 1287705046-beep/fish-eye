@@ -1,0 +1,11 @@
+# fish-eye —— 陪看插件
+#
+# 一个 bundle：
+#   · host 半（index.js）  给设置页提供 /fish-eye/api/tuning 读写接口
+#   · client 半（client.js）在设置页注册「陪看」分区，四个滑块
+#
+# ⚠️ 行 id 必须与包名一致（fish-eye），否则设置页/插件详情会找不到。
+- insert:
+    - id: fish-eye
+      name: 'fish-eye'
+      config: {}

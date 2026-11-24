@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Watch along",
+    "description": "Let the model watch a video with you: frames are captured when the picture changes, and the capture rhythm is tuned here.",
+    "detail": "docs/DETAIL.md"
+  }
+}
