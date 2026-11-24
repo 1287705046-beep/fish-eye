@@ -22,20 +22,85 @@ const isAi = (t) => /^ai-/i.test(lanOf(t));
 const isZh = (t) => /^(zh|cmn|ai-zh)/i.test(lanOf(t));
 
 /**
- * 轨道优先级：人工中文 > 任意人工 > ai 中文 > 任意 ai > 第一条。
+ * 候选顺序（不是只挑一条）：人工中文 > 任意人工 > ai 中文 > 任意 ai > 其余。
  * 原来 ai-zh 排第一是反的——B站 机器字幕本来最不可信。
+ *
+ * 为什么返回列表而不是一条：2026-11-24 改成双接口合并后会有多条，
+ * 而且人工字幕常常只有一段（UP 主只标了几个片段）——那条过不了覆盖率校验，
+ * 得能退到下一条 AI 字幕。调用方逐条试，别一条不对就整条放弃。
  */
-export function pickSubtitleTrack(tracks) {
+export function rankSubtitleTracks(tracks) {
   const list = (Array.isArray(tracks) ? tracks : [])
     .filter((t) => t && String(t.subtitle_url ?? '') !== '');
-  if (!list.length) return null;
+  if (!list.length) return [];
   const human = list.filter((t) => !isAi(t));
   const ai = list.filter(isAi);
-  return human.find(isZh)
-    || human[0]
-    || ai.find(isZh)
-    || ai[0]
-    || list[0];
+  return [
+    ...human.filter(isZh), ...human.filter((t) => !isZh(t)),
+    ...ai.filter(isZh), ...ai.filter((t) => !isZh(t)),
+  ];
+}
+
+/** 按上面的优先级挑一条。留着给只想要单条的调用方。 */
+export function pickSubtitleTrack(tracks) {
+  return rankSubtitleTracks(tracks)[0] ?? null;
+}
+
+/**
+ * 合并两个接口返回的字幕轨（2026-11-24：新老接口的结果是**互补**的）。
+ *
+ * 实测 4 个样本：
+ *   · B站官方人工字幕（lan=zh, ai_status=0）：只有 wbi/v2 给 url，旧 x/player/v2 只给轨道名、url 空
+ *   · AI 字幕（lan=ai-zh, ai_status=2）：只有旧 x/player/v2 稳定给 url，wbi/v2 常常直接 0 条轨道
+ *
+ * 所以两个响应都要喂进来。只留 url 非空的，按 lan+url 去重，再按优先级排序。
+ */
+export function mergeSubtitleTracks(...responses) {
+  const merged = [];
+  const seen = new Set();
+  for (const json of responses) {
+    for (const track of json?.data?.subtitle?.subtitles ?? []) {
+      const url = String(track?.subtitle_url ?? '').trim();
+      if (!url) continue;
+      const key = `${lanOf(track)}|${url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(track);
+    }
+  }
+  return rankSubtitleTracks(merged);
+}
+
+/**
+ * 逐条试，返回第一条能过校验的字幕。
+ *
+ * 为什么要逐条：人工字幕常常只标了几个片段（覆盖率过不了 30%），
+ * 这时候该退到 AI 字幕，而不是整条放弃。
+ *
+ * @param {Array} tracks mergeSubtitleTracks 的结果
+ * @param {(url:string)=>Promise<Array<{from:number,to:number,text:string}>>} loadCues 由调用方提供（网络在那边）
+ * @returns {Promise<{cues:Array, skipped:string, track:object|null, attempts:Array}>}
+ */
+export async function firstUsableSubtitle(tracks, loadCues, durationSec, limits = SUB_LIMITS) {
+  const attempts = [];
+  for (const track of tracks ?? []) {
+    const raw = String(track?.subtitle_url ?? '');
+    const url = raw.startsWith('//') ? `https:${raw}` : raw;
+    if (!url) { attempts.push({ lan: lanOf(track), ok: false, reason: '没有 url' }); continue; }
+    let cues = [];
+    try {
+      cues = await loadCues(url);
+    } catch {
+      attempts.push({ lan: lanOf(track), ok: false, reason: '下载失败' });
+      continue;
+    }
+    if (!cues?.length) { attempts.push({ lan: lanOf(track), ok: false, reason: '下载为空' }); continue; }
+    const verdict = validateSubtitleCues(cues, durationSec, limits);
+    attempts.push({ lan: lanOf(track), ok: verdict.ok, reason: verdict.reason, verdict });
+    if (verdict.ok) return { cues, skipped: '', track, attempts };
+  }
+  const skipped = attempts.map((a) => `${a.lan}：${a.reason}`).join('；') || '没有可用字幕轨';
+  return { cues: [], skipped, track: null, attempts };
 }
 
 /**
