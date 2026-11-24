@@ -538,7 +538,12 @@ function saveStrip(dir, bv, strip) {
     const ocrStart = Date.now();
     const rows = await ocrStrips(stripFiles.slice().sort((a, b) => a.t - b.t));
     const good = rows
-      .map((row) => ({ t: Number(row?.t) || 0, text: String(row?.text ?? '').trim(), conf: Number(row?.conf) || 0 }))
+      .map((row) => ({
+        t: Number(row?.t) || 0,
+        // 首尾的标点是背景噪声（引号、顿号、逗号），清掉再判断有没有字
+        text: String(row?.text ?? '').trim().replace(/^[^\u4e00-\u9fa5A-Za-z0-9]+|[^\u4e00-\u9fa5A-Za-z0-9]+$/g, ''),
+        conf: Number(row?.conf) || 0,
+      }))
       .filter((row) => row.text && row.conf >= subConf && /[\u4e00-\u9fa5A-Za-z0-9]/.test(row.text));
     // 同一句连着出现只留第一条：字幕常停 1~2 秒，会被裁两次
     const dedup = [];
