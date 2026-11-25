@@ -303,27 +303,42 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     if (state.mode === 'fast') return med >= ADAPT_MED * 0.7 ? 'fast' : 'base';
     return med >= ADAPT_MED ? 'fast' : 'base';
   };
+  // 格子大小跟着源比例走（2026-11-25）：原来写死 640×360，竖屏 1080×1920 塞进去就被横着拉扁。
+  // 现在短边固定 360、长边按源比例算：16:9 → 640×360，9:16 → 360×640；长边超 720 再整体缩。
+  state.pickCell = () => {
+    const v = document.querySelector('video');
+    const vw = (v && v.videoWidth) || 16, vh = (v && v.videoHeight) || 9;
+    let cw, ch;
+    if (vw >= vh) { ch = 360; cw = Math.round(360 * vw / vh); }
+    else { cw = 360; ch = Math.round(360 * vh / vw); }
+    const lng = Math.max(cw, ch);
+    if (lng > 720) { const k = 720 / lng; cw = Math.round(cw * k); ch = Math.round(ch * k); }
+    return [Math.max(160, cw), Math.max(160, ch)];
+  };
   state.reset = (m) => {
     if (m) state.mode = (m === 'fast' ? 'fast' : 'base');
     const nc = state.mode === 'fast' ? FCOLS : BCOLS;
     const nr = state.mode === 'fast' ? FROWS : BROWS;
+    const dim = state.pickCell();
     const g = document.createElement('canvas');
-    g.width = CW * nc;
-    g.height = CH * nr;
+    g.width = dim[0] * nc;
+    g.height = dim[1] * nr;
     const c = g.getContext('2d');
     c.fillStyle = '#000'; c.fillRect(0, 0, g.width, g.height);
-    state.cur = { canvas: g, ctx: c, n: 0, times: [], per: nc * nr, cols: nc, rows: nr };
+    state.cur = { canvas: g, ctx: c, n: 0, times: [], per: nc * nr, cols: nc, rows: nr, cw: dim[0], ch: dim[1] };
   };
   // 待定（pick-best）：先画到一张单格 canvas，窗口内可被更强的替换；窗口到了才贴进格子。
   state.beginPending = (v, t, diff) => {
+    const dim = state.pickCell();
     const c = document.createElement('canvas');
-    c.width = CW; c.height = CH;
-    c.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, CW, CH);
+    c.width = dim[0]; c.height = dim[1];
+    c.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, dim[0], dim[1]);
     state.pending = { canvas: c, t: t, diff: diff, swapped: 0 };
   };
   state.swapPending = (v, t, diff) => {
     if (!state.pending) return false;
-    state.pending.canvas.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, CW, CH);
+    const pc = state.pending.canvas;
+    pc.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, pc.width, pc.height);
     state.pending.t = t;
     state.pending.diff = diff;
     state.pending.swapped += 1;
@@ -338,8 +353,8 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     if (state.cur.n >= state.cur.per) state.reset(state.chooseMode());
     const cur = state.cur;
     const i2 = cur.n;
-    const x = (i2 % cur.cols) * CW, y = Math.floor(i2 / cur.cols) * CH;
-    cur.ctx.drawImage(p.canvas, x, y);
+    const x = (i2 % cur.cols) * cur.cw, y = Math.floor(i2 / cur.cols) * cur.ch;
+    cur.ctx.drawImage(p.canvas, x, y, cur.cw, cur.ch);
     // 秒数标签。快剪时两格可能落在同一秒里（播放器缓冲追赶时画面时间会跑得比钟快），
     // 那样两格都写 01:24 看着像重复——同一秒的第二格带上十分之一位。
     // 注意：这段整个在模板字符串里，只能用字符串拼接，不能写反引号模板。
@@ -350,12 +365,15 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     if (prevT != null && Math.floor(prevT) === Math.floor(p.t)) {
       label = mm + ':' + ss + '.' + Math.floor((p.t % 1) * 10);
     }
-    cur.ctx.font = 'bold 26px "Microsoft YaHei", sans-serif';
+    // 字号跟着格子大小走：竖屏格子窄，26px 会盖掉半张画面。
+    const fz = Math.max(14, Math.round(Math.min(cur.cw, cur.ch) / 14));
+    cur.ctx.font = 'bold ' + fz + 'px "Microsoft YaHei", sans-serif';
     const tw = cur.ctx.measureText(label).width;
+    const padX = Math.round(fz * 0.35), padY = Math.round(fz * 0.3);
     cur.ctx.fillStyle = 'rgba(0,0,0,0.62)';
-    cur.ctx.fillRect(x + 8, y + 8, tw + 18, 38);
+    cur.ctx.fillRect(x + padX, y + padY, tw + fz * 0.8, Math.round(fz * 1.5));
     cur.ctx.fillStyle = '#fff';
-    cur.ctx.fillText(label, x + 17, y + 36);
+    cur.ctx.fillText(label, x + padX + Math.round(fz * 0.35), y + padY + Math.round(fz * 1.1));
     cur.n += 1;
     cur.times.push(p.t);
     const info = { t: p.t, diff: p.diff, swapped: p.swapped, mode: state.mode };
@@ -364,6 +382,8 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
       info.times = cur.times.slice();
       info.cols = cur.cols;
       info.rows = cur.rows;
+      info.cw = cur.cw;
+      info.ch = cur.ch;
       state.reset(state.chooseMode());
     }
     return info;
@@ -478,7 +498,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
       const c2 = state.commit();
       if (c2) {
         out.committed = { t: c2.t, mode: c2.mode, swapped: 0 };
-        if (c2.grid) { out.grid = c2.grid; out.times6 = c2.times; out.cols = c2.cols; out.rows = c2.rows; }
+        if (c2.grid) { out.grid = c2.grid; out.times6 = c2.times; out.cols = c2.cols; out.rows = c2.rows; out.cw = c2.cw; out.ch = c2.ch; }
       }
       return out;
     }
@@ -487,7 +507,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     const committed = state.commit();
     if (committed) {
       out.committed = { t: committed.t, mode: committed.mode, swapped: committed.swapped };
-      if (committed.grid) { out.grid = committed.grid; out.times6 = committed.times; out.cols = committed.cols; out.rows = committed.rows; }
+      if (committed.grid) { out.grid = committed.grid; out.times6 = committed.times; out.cols = committed.cols; out.rows = committed.rows; out.cw = committed.cw; out.ch = committed.ch; }
     }
     state.beginPending(v, t, first ? 0 : diff);
     return out;
@@ -497,12 +517,12 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   state.tail = () => {
     const committed = state.commit();
     if (committed && committed.grid) {
-      return { url: committed.grid, times: committed.times, cols: committed.cols, rows: committed.rows, partial: true };
+      return { url: committed.grid, times: committed.times, cols: committed.cols, rows: committed.rows, cw: committed.cw, ch: committed.ch, partial: true };
     }
     const cur = state.cur;
     if (!cur || cur.n <= 0) return null;
     const usedRows = Math.max(1, Math.ceil(cur.n / cur.cols));
-    const w = cur.cols * CW, h = usedRows * CH;
+    const w = cur.cols * cur.cw, h = usedRows * cur.ch;
     let url;
     if (usedRows < cur.rows) {
       const t2 = document.createElement('canvas');
@@ -512,7 +532,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     } else {
       url = cur.canvas.toDataURL('image/jpeg', 0.85);
     }
-    const r = { url, times: cur.times.slice(), cols: cur.cols, rows: usedRows, partial: true };
+    const r = { url, times: cur.times.slice(), cols: cur.cols, rows: usedRows, cw: cur.cw, ch: cur.ch, partial: true };
     state.reset(state.chooseMode());
     return r;
   };
@@ -537,14 +557,15 @@ async function connect() {
   return c;
 }
 
-function saveGrid(dir, bv, tag, url, times, partial, gc, gr) {
+function saveGrid(dir, bv, tag, url, times, partial, gc, gr, cwid, chei) {
   try {
     const file = path.join(dir, `grid-${bv}-${tag}-${Date.now()}.jpg`);
     fs.writeFileSync(file, Buffer.from(String(url).split(',')[1], 'base64'));
     const cc = Math.max(1, Number(gc) || cols), rr = Math.max(1, Number(gr) || rows);
+    const cwi = Math.max(1, Number(cwid) || CELL_W), chi = Math.max(1, Number(chei) || CELL_H);
     let bytes = 0;
     try { bytes = fs.statSync(file).size; } catch {}
-    return { file, w: CELL_W * cc, h: CELL_H * rr, cols: cc, rows: rr, times, partial: !!partial, bytes };
+    return { file, w: cwi * cc, h: chi * rr, cols: cc, rows: rr, cell: [cwi, chi], times, partial: !!partial, bytes };
   } catch (e) {
     log(`写宫格失败：${e?.message ?? e}`);
     return null;
@@ -616,7 +637,7 @@ function saveStrip(dir, bv, strip) {
       if (fails === 1 || fails === 3) {
         const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
         if (!tail.err && tail.value?.url) {
-          const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows);
+          const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch);
           if (saved) result.grids.push(saved);
         }
         prep = await c.eval(helpers, 8000);
@@ -653,7 +674,7 @@ function saveStrip(dir, bv, strip) {
         if (g.value.forced) forces += 1;
       }
       if (g.value.grid) {
-        const saved = saveGrid(dir, result.bv, String(result.frames).padStart(3, '0'), g.value.grid, g.value.times6, false, g.value.cols, g.value.rows);
+        const saved = saveGrid(dir, result.bv, String(result.frames).padStart(3, '0'), g.value.grid, g.value.times6, false, g.value.cols, g.value.rows, g.value.cw, g.value.ch);
         if (saved) {
           result.grids.push(saved);
           keptBytes += saved.bytes || 0;
@@ -678,7 +699,7 @@ function saveStrip(dir, bv, strip) {
 
   const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
   if (!tail.err && tail.value?.url) {
-    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows);
+    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch);
     if (saved) result.grids.push(saved);
   }
   await c.eval('try { if (window.__biliEye) window.__biliEye.ok = false } catch (e) {}', 3000);
