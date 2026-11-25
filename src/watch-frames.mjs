@@ -4,11 +4,24 @@
 //
 // 1) 每 scan 秒取一张 32×18 缩略图，和上一张算平均绝对差，本地打分（不花模型钱）。
 // 2) 差异够大（换镜头/动作）就留一格；画面没怎么动就跳过，但每 force-gap 秒强制留一张兜底。
-// 3) 攒满 4 格（默认 2×2）立刻交回 node 落盘——页面被导航清掉也不丢。
-// 4) 跑满 seconds（默认 300）、攒满 max-grids（默认 8）或播完就收尾，返回每张图的路径和每格的秒数。
+// 3) 攒满一格立刻交回 node 落盘——页面被导航清掉也不丢。
+// 4) 跑满 seconds（默认 300）、攒满 max-grids 或播完就收尾，返回每张图的路径和每格的秒数。
+//
+// 宫格按内容自适应（--adapt 1，默认开）：
+//   快剪（变化量中位数 ≥ 35）用 3×2 六格 1920×720；其余用 2×2 四格 1280×720。
+//   1920×720 长边不缩、每格仍是 640×360，宿主那头也不用二次缩放；
+//   1920×1080 的九宫格会被缩放器缩掉一成，作画细节掉一档，所以没上九格。
+//   判据用「最近 6 跳的中位数」而不是「超阈值的次数」——快剪和慢片里都常有大量单点尖峰，
+//   按次数判会把慢片误判成快剪（实测慢片 30% 的跳都 >35，中位只有 19）。带迟滞，不会来回翻。
+//
+// 窗口内挑最强（--pick-best 1，默认开）：
+//   留一帧先画到一张待定的单格，min-gap 窗口里出现「比它强 1.5 倍」的一跳就把它换掉。
+//   张数不变、不涨 token，只是让每一格放的是这段时间里最值的那一帧。
 //
 // 用法：node src/watch-frames.mjs [--seconds 300] [--th 20] [--scan 0.5] [--force-gap 20]
 //                                [--cols 2] [--rows 2] [--max-grids 20] [--bv BVxxx] [--json]
+//                                [--adapt 0|1] [--adapt-median 35] [--fast-cols 3] [--fast-rows 2]
+//                                [--pick-best 0|1] [--best-ratio 1.5] [--adapt-force fast|slow]
 // 环境变量：BILI_CDP_PORT（默认 9333）、BILI_FRAME_DIR（默认 ~/.cache/bili-watch-frames）、BILI_WATCH_LOG、
 //          FISH_EYE_TUNING（参数文件，默认 ~/.dsh/see-now/watch-tuning.json）
 //
@@ -47,6 +60,25 @@ const cols = Math.max(1, Math.min(4, Number(arg('cols', 2)) || 2));           //
 const rows = Math.max(1, Math.min(4, Number(arg('rows', 2)) || 2));           // 每张几行
 const perGrid = cols * rows;
 const maxGrids = Math.max(0, Math.min(40, Number(arg('max-grids', TUNING.maxGrids)) || TUNING.maxGrids));
+
+// ── 自适应宫格 + 窗口内挑最强（2026-11-25）──────────────────────────────────
+// 两个都默认开；关掉就退回老行为（--adapt 0 / --pick-best 0）。
+const ADAPT       = Number(arg('adapt', 1)) !== 0;
+const ADAPT_MED   = Number(arg('adapt-median', 35)) || 35;
+// 阈值 35 是三片实测定的（中位数）：作画MAD 49.1 / 剧情动画 19.0 / 综艺杂谈 5.0。
+// 一开始拍脑袋用了 25，结果慢片 42% 的跳都超过 25，一跑就被判成快剪。
+const FAST_COLS   = Math.max(1, Math.min(4, Number(arg('fast-cols', 3)) || 3));
+const FAST_ROWS   = Math.max(1, Math.min(4, Number(arg('fast-rows', 2)) || 2));
+const PICK_BEST   = Number(arg('pick-best', 1)) !== 0;
+const BEST_RATIO  = Math.max(1, Math.min(5, Number(arg('best-ratio', 1.5)) || 1.5));
+const ADAPT_FORCE = String(arg('adapt-force', '') || '');    // 测试用：fast / slow
+const PAGE_CFG = {
+  adapt: ADAPT, adaptMedian: ADAPT_MED, fastCols: FAST_COLS, fastRows: FAST_ROWS,
+  pickBest: PICK_BEST, bestRatio: BEST_RATIO, force: ADAPT_FORCE,
+};
+// 一张图一张图往外送，调用方（模型）用 base64 塞进一条消息里，太大会被静默丢掉而 ok 还是 true。
+// 2.6MB 是实测的安全线（base64 后约 3.5MB）；六格 1920×720 一张约 140KB，到顶约 18 张。
+const MAX_BYTES = Number(process.env.BILI_MAX_BYTES) > 0 ? Number(process.env.BILI_MAX_BYTES) : 2_600_000;
 // ── 字幕条 + OCR（2026-11-24 定稿）─────────────────────────────────────────
 // B站 大量视频的字幕是**烧在画面里**的：没有 <track>、没有 DOM、接口返回 0 条轨。
 // 做法：每 --sub-gap 秒看一眼画面底部，变了就裁一条（反色二值化，白字变黑字白底），
@@ -164,11 +196,14 @@ class Cdp {
 }
 
 // 页面里的扫描器：缩略图打分 → 决定留不留 → 留就画进 3×2 的格子；满一张交回来，node 立刻落盘。
-const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs) => `(() => {
+const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   if (window.__biliEye && window.__biliEye.ok) return { ok: true, reused: true };
-  const COLS = ${cols}, PER = ${perGrid}, CW = ${cellW}, CH = ${cellH};
+  const BCOLS = ${cols}, BROWS = ${Math.max(1, Math.round(perGrid / cols))}, CW = ${cellW}, CH = ${cellH};
+  const FCOLS = ${cfg.fastCols}, FROWS = ${cfg.fastRows};
+  const ADAPT = ${cfg.adapt ? 1 : 0}, ADAPT_MED = ${cfg.adaptMedian}, FORCED = ${JSON.stringify(cfg.force || '')};
+  const PICK_BEST = ${cfg.pickBest ? 1 : 0}, BEST_RATIO = ${cfg.bestRatio};
   const SUB_GAP = ${subGapMs};
-  const state = { ok: true, prevLum: null, prevSub: null, lastT: -99, lastKeepAt: 0, lastStripAt: 0, strips: 0, cur: null };
+  const state = { ok: true, prevLum: null, prevSub: null, lastT: -99, lastKeepAt: 0, lastStripAt: 0, strips: 0, cur: null, pending: null, mode: 'base', recentDiffs: [] };
   const probe = document.createElement('canvas');
   probe.width = 32; probe.height = 18;
   state.probeCtx = probe.getContext('2d', { willReadFrequently: true });
@@ -251,15 +286,75 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs) => `(() => {
     const spike = a.baseline > 1 ? mean / a.baseline : 1;
     return { mean: +mean.toFixed(1), low: +low.toFixed(1), base: +a.baseline.toFixed(1), spike: +spike.toFixed(2), hit: spike >= h };
   };
-  state.reset = () => {
+  // 档位：快剪 → 3×2 六宫格；其余 → 2×2。判据只用现成的变化量，按「批次开头」定，一批之内不换。
+  state.chooseMode = () => {
+    if (FORCED === 'fast' || FORCED === 'slow') return FORCED;
+    if (!ADAPT) return 'base';
+    const a = state.recentDiffs.slice(-6).slice().sort((x, y) => x - y);
+    if (a.length < 2) return 'base';
+    const med = a[Math.floor(a.length / 2)];
+    // 迟滞：进六格要 >= 阈值，退回四格要掉到 7 成以下 —— 免得在一条片里来回翻。
+    if (state.mode === 'fast') return med >= ADAPT_MED * 0.7 ? 'fast' : 'base';
+    return med >= ADAPT_MED ? 'fast' : 'base';
+  };
+  state.reset = (m) => {
+    if (m) state.mode = (m === 'fast' ? 'fast' : 'base');
+    const nc = state.mode === 'fast' ? FCOLS : BCOLS;
+    const nr = state.mode === 'fast' ? FROWS : BROWS;
     const g = document.createElement('canvas');
-    g.width = CW * COLS;
-    g.height = CH * Math.ceil(PER / COLS);
+    g.width = CW * nc;
+    g.height = CH * nr;
     const c = g.getContext('2d');
     c.fillStyle = '#000'; c.fillRect(0, 0, g.width, g.height);
-    state.cur = { canvas: g, ctx: c, n: 0, times: [] };
+    state.cur = { canvas: g, ctx: c, n: 0, times: [], per: nc * nr, cols: nc, rows: nr };
   };
-  state.reset();
+  // 待定（pick-best）：先画到一张单格 canvas，窗口内可被更强的替换；窗口到了才贴进格子。
+  state.beginPending = (v, t, diff) => {
+    const c = document.createElement('canvas');
+    c.width = CW; c.height = CH;
+    c.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, CW, CH);
+    state.pending = { canvas: c, t: t, diff: diff, swapped: 0 };
+  };
+  state.swapPending = (v, t, diff) => {
+    if (!state.pending) return false;
+    state.pending.canvas.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, CW, CH);
+    state.pending.t = t;
+    state.pending.diff = diff;
+    state.pending.swapped += 1;
+    return true;
+  };
+  // 把待定的那一帧真正贴进格子；满一张就把图交回去，并按最新变化量给下一张定档。
+  state.commit = () => {
+    const p = state.pending;
+    if (!p) return null;
+    state.pending = null;
+    if (!state.cur) state.reset(state.chooseMode());
+    if (state.cur.n >= state.cur.per) state.reset(state.chooseMode());
+    const cur = state.cur;
+    const i2 = cur.n;
+    const x = (i2 % cur.cols) * CW, y = Math.floor(i2 / cur.cols) * CH;
+    cur.ctx.drawImage(p.canvas, x, y);
+    const label = String(Math.floor(p.t / 60)).padStart(2, '0') + ':' + String(Math.floor(p.t % 60)).padStart(2, '0');
+    cur.ctx.font = 'bold 26px "Microsoft YaHei", sans-serif';
+    const tw = cur.ctx.measureText(label).width;
+    cur.ctx.fillStyle = 'rgba(0,0,0,0.62)';
+    cur.ctx.fillRect(x + 8, y + 8, tw + 18, 38);
+    cur.ctx.fillStyle = '#fff';
+    cur.ctx.fillText(label, x + 17, y + 36);
+    cur.n += 1;
+    cur.times.push(p.t);
+    const info = { t: p.t, diff: p.diff, swapped: p.swapped, mode: state.mode };
+    if (cur.n >= cur.per) {
+      info.grid = cur.canvas.toDataURL('image/jpeg', 0.85);
+      info.times = cur.times.slice();
+      info.cols = cur.cols;
+      info.rows = cur.rows;
+      state.reset(state.chooseMode());
+    }
+    return info;
+  };
+  // 第一张也走自适应：canvas 先不建，等第一次落帧（约 3 秒、已有 4~5 跳数据）再按档位建。
+  state.cur = null;
   state.info = () => {
     const v = document.querySelector('video');
     const m = location.href.match(/\\/video\\/(BV[0-9A-Za-z]{10})/);
@@ -301,6 +396,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs) => `(() => {
     }
     const first = !state.prevLum;
     state.prevLum = lum;
+    if (!first) { state.recentDiffs.push(diff); if (state.recentDiffs.length > 12) state.recentDiffs.shift(); }
 
     // ①b 字幕条：底部这条带子变了，就把"字幕那一行"裁下来。
     //     不做识别（识别在 node 侧批量做）——这里只负责便宜地挑出"值得 OCR"的时刻。
@@ -348,37 +444,61 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs) => `(() => {
     const tooSoon = state.lastKeepAt > 0 && (now - state.lastKeepAt) < minGapMs;
     // 音量只记录、不抓帧：一声爆炸不该多塞一张图，看片的人会被莫名叫醒
     const keep = first || (!tooSoon && !flat && (diff >= threshold || forced));
-    if (!keep) return { t, diff: +diff.toFixed(2), kept: false, flat, subStrip, spike: loud ? loud.spike : 0, paused: v.paused, ended: v.ended };
+
+    // ③b 窗口内挑最强：这一跳被 min-gap 拦下，但它比待定的那张强得多 → 换掉待定的内容。
+    //     不算"留帧"（不另占格子、不动 lastKeepAt），只是让这一格放得更值。
+    let swappedNow = 0;
+    if (!keep && PICK_BEST && state.pending && !flat && diff >= threshold && diff > state.pending.diff * BEST_RATIO) {
+      if (state.swapPending(v, t, diff)) swappedNow = state.pending.swapped;
+    }
+
+    if (!keep) return { t, diff: +diff.toFixed(2), kept: false, flat, subStrip, spike: loud ? loud.spike : 0, swapped: swappedNow, paused: v.paused, ended: v.ended };
     state.lastKeepAt = now;
 
-    // ③ 画进格子
-    if (state.cur.n >= PER) state.reset();
-    const { canvas, ctx } = state.cur;
-    const i2 = state.cur.n;
-    const x = (i2 % COLS) * CW, y = Math.floor(i2 / COLS) * CH;
-    ctx.drawImage(v, 0, 0, v.videoWidth, v.videoHeight, x, y, CW, CH);
-    const label = String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(Math.floor(t % 60)).padStart(2, '0');
-    ctx.font = 'bold 26px "Microsoft YaHei", sans-serif';
-    const tw = ctx.measureText(label).width;
-    ctx.fillStyle = 'rgba(0,0,0,0.62)';
-    ctx.fillRect(x + 8, y + 8, tw + 18, 38);
-    ctx.fillStyle = '#fff';
-    ctx.fillText(label, x + 17, y + 36);
-    state.cur.n += 1;
-    state.cur.times.push(t);
+    const out = { t, diff: +diff.toFixed(2), kept: true, cut: diff >= threshold, forced, loudHit, subStrip, spike: loud ? loud.spike : 0, swapped: swappedNow, paused: v.paused, ended: v.ended };
 
-    const out = { t, diff: +diff.toFixed(2), kept: true, cut: diff >= threshold, forced, loudHit, subStrip, spike: loud ? loud.spike : 0, paused: v.paused, ended: v.ended };
-    if (state.cur.n >= PER) {
-      out.grid = canvas.toDataURL('image/jpeg', 0.85);
-      out.times6 = state.cur.times.slice();
-      state.reset();
+    if (!PICK_BEST) {
+      // 老行为：这一帧直接进格子（先过一遍待定，代码路径只有一条，别养两份逻辑）
+      state.beginPending(v, t, first ? 0 : diff);
+      const c2 = state.commit();
+      if (c2) {
+        out.committed = { t: c2.t, mode: c2.mode, swapped: 0 };
+        if (c2.grid) { out.grid = c2.grid; out.times6 = c2.times; out.cols = c2.cols; out.rows = c2.rows; }
+      }
+      return out;
     }
+
+    // ③c 窗口到了：上一张待定先落进格子，这一帧变成新的待定（min-gap 秒后再决）
+    const committed = state.commit();
+    if (committed) {
+      out.committed = { t: committed.t, mode: committed.mode, swapped: committed.swapped };
+      if (committed.grid) { out.grid = committed.grid; out.times6 = committed.times; out.cols = committed.cols; out.rows = committed.rows; }
+    }
+    state.beginPending(v, t, first ? 0 : diff);
     return out;
   };
+  // 收尾：先把还在待定的那张交出去，再把没满的这张半成品交回（一帧都不丢）。
+  // 半成品要裁掉没用到的那几行——六格片收尾只剩 2 帧时，留着 1920×1080 的黑底既白花 token 又难看。
   state.tail = () => {
-    if (!state.cur || state.cur.n <= 0) return null;
-    const r = { url: state.cur.canvas.toDataURL('image/jpeg', 0.85), times: state.cur.times.slice(), partial: true };
-    state.reset();
+    const committed = state.commit();
+    if (committed && committed.grid) {
+      return { url: committed.grid, times: committed.times, cols: committed.cols, rows: committed.rows, partial: true };
+    }
+    const cur = state.cur;
+    if (!cur || cur.n <= 0) return null;
+    const usedRows = Math.max(1, Math.ceil(cur.n / cur.cols));
+    const w = cur.cols * CW, h = usedRows * CH;
+    let url;
+    if (usedRows < cur.rows) {
+      const t2 = document.createElement('canvas');
+      t2.width = w; t2.height = h;
+      t2.getContext('2d').drawImage(cur.canvas, 0, 0, w, h, 0, 0, w, h);
+      url = t2.toDataURL('image/jpeg', 0.85);
+    } else {
+      url = cur.canvas.toDataURL('image/jpeg', 0.85);
+    }
+    const r = { url, times: cur.times.slice(), cols: cur.cols, rows: usedRows, partial: true };
+    state.reset(state.chooseMode());
     return r;
   };
   window.__biliEye = state;
@@ -402,11 +522,14 @@ async function connect() {
   return c;
 }
 
-function saveGrid(dir, bv, tag, url, times, partial) {
+function saveGrid(dir, bv, tag, url, times, partial, gc, gr) {
   try {
     const file = path.join(dir, `grid-${bv}-${tag}-${Date.now()}.jpg`);
     fs.writeFileSync(file, Buffer.from(String(url).split(',')[1], 'base64'));
-    return { file, w: CELL_W * cols, h: CELL_H * rows, times, partial: !!partial };
+    const cc = Math.max(1, Number(gc) || cols), rr = Math.max(1, Number(gr) || rows);
+    let bytes = 0;
+    try { bytes = fs.statSync(file).size; } catch {}
+    return { file, w: CELL_W * cc, h: CELL_H * rr, cols: cc, rows: rr, times, partial: !!partial, bytes };
   } catch (e) {
     log(`写宫格失败：${e?.message ?? e}`);
     return null;
@@ -427,10 +550,11 @@ function saveStrip(dir, bv, strip) {
 
 (async () => {
   const startedAt = Date.now();
-  const helpers = PAGE_HELPERS(cols, perGrid, CELL_W, CELL_H, SUB_OCR ? subGapMs : 0);
+  const helpers = PAGE_HELPERS(cols, perGrid, CELL_W, CELL_H, SUB_OCR ? subGapMs : 0, PAGE_CFG);
   const result = {
     ok: false, bv: '', from: 0, to: 0, ended: false,
     scanned: 0, kept: 0, frames: 0, grids: [], subtitles: [], strips: 0, note: '',
+    swaps: 0, gridSizes: {},
   };
 
   let c = null;
@@ -466,7 +590,7 @@ function saveStrip(dir, bv, strip) {
   const forceGapMs = forceGapSec * 1000;
   const stripFiles = [];
   let fails = 0, skips = 0, pausedSince = 0;
-  let cuts = 0, forces = 0, maxSpike = 0;
+  let cuts = 0, forces = 0, maxSpike = 0, swaps = 0, keptBytes = 0;
   const loudTimes = [];
 
   while (Date.now() < deadline) {
@@ -477,7 +601,7 @@ function saveStrip(dir, bv, strip) {
       if (fails === 1 || fails === 3) {
         const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
         if (!tail.err && tail.value?.url) {
-          const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true);
+          const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows);
           if (saved) result.grids.push(saved);
         }
         prep = await c.eval(helpers, 8000);
@@ -504,6 +628,7 @@ function saveStrip(dir, bv, strip) {
       }
       if (typeof g.value.spike === 'number' && g.value.spike > maxSpike) maxSpike = g.value.spike;
       result.to = g.value.t;
+      if (g.value.swapped) swaps += 1;   // 窗口内换帧不一定伴随"留帧"，得单独数
       if (g.value.kept) {
         if (g.value.loudHit) loudTimes.push(g.value.t);
         result.kept += 1;
@@ -512,9 +637,18 @@ function saveStrip(dir, bv, strip) {
         if (g.value.forced) forces += 1;
       }
       if (g.value.grid) {
-        const saved = saveGrid(dir, result.bv, String(result.frames).padStart(3, '0'), g.value.grid, g.value.times6, false);
-        if (saved) result.grids.push(saved);
+        const saved = saveGrid(dir, result.bv, String(result.frames).padStart(3, '0'), g.value.grid, g.value.times6, false, g.value.cols, g.value.rows);
+        if (saved) {
+          result.grids.push(saved);
+          keptBytes += saved.bytes || 0;
+          const k = `${saved.cols}x${saved.rows}`;
+          result.gridSizes[k] = (result.gridSizes[k] || 0) + 1;
+        }
         if (maxGrids > 0 && result.grids.length >= maxGrids) break;
+        if (keptBytes > MAX_BYTES) {
+          result.note = `这批攒到 ${(keptBytes / 1048576).toFixed(1)}MB（${result.grids.length} 张），到体积预算了先交给你`;
+          break;
+        }
       }
       if (g.value.ended) { result.ended = true; break; }
     }
@@ -526,7 +660,7 @@ function saveStrip(dir, bv, strip) {
 
   const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
   if (!tail.err && tail.value?.url) {
-    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true);
+    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows);
     if (saved) result.grids.push(saved);
   }
   await c.eval('try { if (window.__biliEye) window.__biliEye.ok = false } catch (e) {}', 3000);
@@ -565,12 +699,14 @@ function saveStrip(dir, bv, strip) {
   result.ok = result.frames > 0 && result.grids.length > 0;
   result.cuts = cuts;
   result.forces = forces;
+  result.swaps = swaps;
   result.loud = loudTimes.slice(0, 30);
   result.maxSpike = +maxSpike.toFixed(2);
   if (!result.note) {
     const subNote = result.subtitles.length ? `，字幕 ${result.subtitles.length} 句` : '';
+    const sizes = Object.entries(result.gridSizes).map(([k, v]) => `${k}×${v}`).join(' ');
     result.note = result.ok
-      ? `扫了 ${result.scanned} 次，留 ${result.frames} 个画面（换镜头 ${cuts}、兜底 ${forces}${subNote}），拼成 ${result.grids.length} 张`
+      ? `扫了 ${result.scanned} 次，留 ${result.frames} 个画面（换镜头 ${cuts}、兜底 ${forces}、窗口内换掉 ${swaps}${subNote}），拼成 ${result.grids.length} 张${sizes ? `（宫格 ${sizes}）` : ''}`
       : '一个画面都没留';
   }
   log(`${result.bv} ${result.from}→${result.to}s 扫${result.scanned} 留${result.frames} 格${result.grids.length} ${result.ended ? '播完' : '到点'}`);
