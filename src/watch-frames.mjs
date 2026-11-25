@@ -72,9 +72,14 @@ const FAST_ROWS   = Math.max(1, Math.min(4, Number(arg('fast-rows', 2)) || 2));
 const PICK_BEST   = Number(arg('pick-best', 1)) !== 0;
 const BEST_RATIO  = Math.max(1, Math.min(5, Number(arg('best-ratio', 1.5)) || 1.5));
 const ADAPT_FORCE = String(arg('adapt-force', '') || '');    // 测试用：fast / slow
+// 快剪时加密度（2026-11-25）：留帧间隔 3s → fast-min-gap（默认 1s）；
+// 扫描节拍 0.6s → fast-scan（默认 0.2s）。实测 node 每跳的往返会被播放器渲染挤，
+// 请求 0.2 秒只能拿到约 0.44 秒/跳，但仍然比 0.62 秒快得多。慢片完全不受影响。
+const FAST_MIN_GAP = Math.max(0, Math.min(10, Number(arg('fast-min-gap', 1)))) * 1000;
+const FAST_SCAN_MS = Math.max(80, Math.min(2000, Number(arg('fast-scan', 0.2)) * 1000));
 const PAGE_CFG = {
   adapt: ADAPT, adaptMedian: ADAPT_MED, fastCols: FAST_COLS, fastRows: FAST_ROWS,
-  pickBest: PICK_BEST, bestRatio: BEST_RATIO, force: ADAPT_FORCE,
+  pickBest: PICK_BEST, bestRatio: BEST_RATIO, force: ADAPT_FORCE, fastMinGapMs: FAST_MIN_GAP,
 };
 // 一张图一张图往外送，调用方（模型）用 base64 塞进一条消息里，太大会被静默丢掉而 ok 还是 true。
 // 2.6MB 是实测的安全线（base64 后约 3.5MB）；六格 1920×720 一张约 140KB，到顶约 18 张。
@@ -202,6 +207,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   const FCOLS = ${cfg.fastCols}, FROWS = ${cfg.fastRows};
   const ADAPT = ${cfg.adapt ? 1 : 0}, ADAPT_MED = ${cfg.adaptMedian}, FORCED = ${JSON.stringify(cfg.force || '')};
   const PICK_BEST = ${cfg.pickBest ? 1 : 0}, BEST_RATIO = ${cfg.bestRatio};
+  const FMIN_GAP = ${cfg.fastMinGapMs || 1000};   // 快剪时的留帧间隔（毫秒）
   const SUB_GAP = ${subGapMs};
   const state = { ok: true, prevLum: null, prevSub: null, lastT: -99, lastKeepAt: 0, lastStripAt: 0, strips: 0, cur: null, pending: null, mode: 'base', recentDiffs: [] };
   const probe = document.createElement('canvas');
@@ -334,7 +340,16 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     const i2 = cur.n;
     const x = (i2 % cur.cols) * CW, y = Math.floor(i2 / cur.cols) * CH;
     cur.ctx.drawImage(p.canvas, x, y);
-    const label = String(Math.floor(p.t / 60)).padStart(2, '0') + ':' + String(Math.floor(p.t % 60)).padStart(2, '0');
+    // 秒数标签。快剪时两格可能落在同一秒里（播放器缓冲追赶时画面时间会跑得比钟快），
+    // 那样两格都写 01:24 看着像重复——同一秒的第二格带上十分之一位。
+    // 注意：这段整个在模板字符串里，只能用字符串拼接，不能写反引号模板。
+    const mm = String(Math.floor(p.t / 60)).padStart(2, '0');
+    const ss = String(Math.floor(p.t % 60)).padStart(2, '0');
+    let label = mm + ':' + ss;
+    const prevT = cur.times.length ? cur.times[cur.times.length - 1] : null;
+    if (prevT != null && Math.floor(prevT) === Math.floor(p.t)) {
+      label = mm + ':' + ss + '.' + Math.floor((p.t % 1) * 10);
+    }
     cur.ctx.font = 'bold 26px "Microsoft YaHei", sans-serif';
     const tw = cur.ctx.measureText(label).width;
     cur.ctx.fillStyle = 'rgba(0,0,0,0.62)';
@@ -441,7 +456,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     const nearlyStill = diff < 0.3;
     const forceAfter = forceGapMs * (nearlyStill ? 3 : 1);  // 完全不动（<0.3）= 20×3 = 60 秒才留一张
     const forced = (now - state.lastKeepAt) >= forceAfter;
-    const tooSoon = state.lastKeepAt > 0 && (now - state.lastKeepAt) < minGapMs;
+    const tooSoon = state.lastKeepAt > 0 && (now - state.lastKeepAt) < (state.mode === 'fast' ? FMIN_GAP : minGapMs);
     // 音量只记录、不抓帧：一声爆炸不该多塞一张图，看片的人会被莫名叫醒
     const keep = first || (!tooSoon && !flat && (diff >= threshold || forced));
 
@@ -590,7 +605,7 @@ function saveStrip(dir, bv, strip) {
   const forceGapMs = forceGapSec * 1000;
   const stripFiles = [];
   let fails = 0, skips = 0, pausedSince = 0;
-  let cuts = 0, forces = 0, maxSpike = 0, swaps = 0, keptBytes = 0;
+  let cuts = 0, forces = 0, maxSpike = 0, swaps = 0, keptBytes = 0, lastMode = 'base';
   const loudTimes = [];
 
   while (Date.now() < deadline) {
@@ -628,6 +643,7 @@ function saveStrip(dir, bv, strip) {
       }
       if (typeof g.value.spike === 'number' && g.value.spike > maxSpike) maxSpike = g.value.spike;
       result.to = g.value.t;
+      if (g.value.committed && g.value.committed.mode) lastMode = g.value.committed.mode;
       if (g.value.swapped) swaps += 1;   // 窗口内换帧不一定伴随"留帧"，得单独数
       if (g.value.kept) {
         if (g.value.loudHit) loudTimes.push(g.value.t);
@@ -655,7 +671,9 @@ function saveStrip(dir, bv, strip) {
 
     const remain = deadline - Date.now();
     if (remain <= 0) break;
-    await sleep(Math.min(scanSec * 1000, remain));
+    // 快剪时催一催：0.2 秒一跳（实测拿到 ~0.44 秒），慢片还是按参数文件的 scan。
+    const beat = lastMode === 'fast' ? FAST_SCAN_MS : scanSec * 1000;
+    await sleep(Math.min(beat, remain));
   }
 
   const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
