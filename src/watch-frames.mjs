@@ -457,6 +457,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
       d: v ? Math.round(v.duration || 0) : 0,
       paused: v ? v.paused : true,
       ended: v ? v.ended : false,
+      title: String(document.title || '').slice(0, 80),
     };
   };
   // 返回很小一个对象；只有拼满一张时带 url
@@ -683,6 +684,7 @@ function saveStrip(dir, bv, strip) {
   const info = meta.value;
   result.bv = info.bv || wantBv || 'video';
   result.from = info.t || 0;
+  result.title = info.title || '';   // 给「本子衔接」用：按标题找她的观剧笔记
   if (!info.hasVideo) { result.note = '页面上没有播放器'; c.close(); return emit(result); }
 
   await c.eval('window.__fishEye && window.__fishEye.initAudio && window.__fishEye.initAudio()', 8000);
