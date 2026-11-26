@@ -444,7 +444,9 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   state.cur = null;
   state.info = () => {
     const v = document.querySelector('video');
-    const m = location.href.match(/\\/video\\/(BV[0-9A-Za-z]{10})/);
+    // 番剧没有 BV 号，用 ep 号当集号（帧目录就叫 ep431777），这样进度和观剧笔记能对上集。
+    const m = location.href.match(/\\/video\\/(BV[0-9A-Za-z]{10})/)
+      || location.href.match(/\\/bangumi\\/play\\/(ep\\d+)/);
     let bv = m ? m[1] : '';
     try {
       const st = window.__INITIAL_STATE__;
@@ -567,6 +569,28 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   };
   // 收尾：先把还在待定的那张交出去，再把没满的这张半成品交回（一帧都不丢）。
   // 半成品要裁掉没用到的那几行——六格片收尾只剩 2 帧时，留着 1920×1080 的黑底既白花 token 又难看。
+  // 图角角标：本批拼了几格（比如 2/9）。只在没拼满时印——压在右下角、离边 2px、
+  // 小字号半透明底。半张图的右下角本来就是空的（没填满的格位是画布黑底），
+  // 压在那儿正好不挡画面，也不跟每格左上角的时间/序号抢位置。
+  state.stampCount = (src, w, h, n, per) => {
+    const t2 = document.createElement('canvas');
+    t2.width = w; t2.height = h;
+    const c2 = t2.getContext('2d');
+    c2.drawImage(src, 0, 0, w, h);
+    const fz = Math.max(12, Math.round(Math.min(w, h) / 40));
+    const txt = n + '/' + per;
+    c2.font = 'bold ' + fz + 'px "Microsoft YaHei", sans-serif';
+    const tw = c2.measureText(txt).width;
+    const padX = Math.round(fz * 0.28), padY = Math.round(fz * 0.2);
+    const bw = Math.round(tw + padX * 2), bh = Math.round(fz + padY * 2);
+    const x = Math.max(0, w - bw - 2), y = Math.max(0, h - bh - 2);
+    c2.fillStyle = 'rgba(0,0,0,0.5)';
+    c2.fillRect(x, y, bw, bh);
+    c2.fillStyle = 'rgba(255,255,255,0.9)';
+    c2.fillText(txt, x + padX, y + bh - padY - Math.round(fz * 0.1));
+    return t2.toDataURL('image/jpeg', 0.85);
+  };
+
   state.tail = () => {
     const committed = state.commit();
     if (committed && committed.grid) {
@@ -588,7 +612,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
         state.drawLabel(c2, px, py, cur.cw, cur.ch, state.labelFor(cur.times[i], i ? cur.times[i - 1] : null), i + 1);
       }
       const rp = {
-        url: g2.toDataURL('image/jpeg', 0.85), times: cur.times.slice(),
+        url: state.stampCount(g2, g2.width, g2.height, cur.n, cur.per), times: cur.times.slice(),
         cols: rc, rows: rr, cw: cur.cw, ch: cur.ch, partial: true, repacked: true,
       };
       state.reset(state.chooseMode());
@@ -601,14 +625,83 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
       const t2 = document.createElement('canvas');
       t2.width = w; t2.height = h;
       t2.getContext('2d').drawImage(cur.canvas, 0, 0, w, h, 0, 0, w, h);
-      url = t2.toDataURL('image/jpeg', 0.85);
+      url = state.stampCount(t2, w, h, cur.n, cur.per);
     } else {
-      url = cur.canvas.toDataURL('image/jpeg', 0.85);
+      url = state.stampCount(cur.canvas, w, h, cur.n, cur.per);
     }
     const r = { url, times: cur.times.slice(), cols: cur.cols, rows: usedRows, cw: cur.cw, ch: cur.ch, partial: true };
     state.reset(state.chooseMode());
     return r;
   };
+
+  // ── 跨批接力（2026-11-26 狗修金定：递送原则）────────────────────────────
+  // 一批看不满一张，别把半张当成品送去就完事：把已经抓到的帧交出来存盘，
+  // 下一批抓到的新帧填进这些空格里，填满 9 格才出完整图。
+  // 中断了、隔一阵子回来还看同一集，都能接着往上填（换片或往回跳才作废）。
+  //
+  // dump：把当前攒着的每帧单独编码交出去（存盘用）。parts 里可能是 canvas，
+  // 也可能是上次 preload 画回来的 canvas——统一走 toDataURL，尺寸都是 cw×ch。
+  state.dump = () => {
+    const cur = state.cur;
+    if (!cur || cur.n <= 0) return null;
+    return {
+      times: cur.times.slice(),
+      parts: cur.parts.map((cv) => cv.toDataURL('image/jpeg', 0.85)),
+      cols: cur.cols, rows: cur.rows, cw: cur.cw, ch: cur.ch, per: cur.per,
+      mode: state.mode,
+      lastT: cur.times.length ? cur.times[cur.times.length - 1] : 0,
+    };
+  };
+
+  // preload：把上次攒的帧画回格子，返回接上了几帧。
+  // 行列和格子尺寸照上次那张来（不按这次档位重算，否则竖版/横版会错位）。
+  state.preload = async (saved) => {
+    if (!saved || !Array.isArray(saved.parts) || !saved.parts.length) return 0;
+    const nc = Math.max(1, Math.min(4, Number(saved.cols) || 3));
+    const nr = Math.max(1, Math.min(4, Number(saved.rows) || 3));
+    const cw0 = Math.max(120, Number(saved.cw) || 432);
+    const ch0 = Math.max(120, Number(saved.ch) || 243);
+    const g = document.createElement('canvas');
+    g.width = cw0 * nc; g.height = ch0 * nr;
+    const c = g.getContext('2d');
+    c.fillStyle = '#000'; c.fillRect(0, 0, g.width, g.height);
+    state.cur = { canvas: g, ctx: c, n: 0, times: [], parts: [], per: nc * nr, cols: nc, rows: nr, cw: cw0, ch: ch0 };
+    state.mode = saved.mode === 'fast' ? 'fast' : 'base';
+    const cuts = saved.parts.slice(0, nc * nr);
+    const imgs = await Promise.all(cuts.map((u) => new Promise((res) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = () => res(null);
+      im.src = u;
+    })));
+    for (let i = 0; i < imgs.length; i += 1) {
+      const im = imgs[i];
+      if (!im) continue;
+      const cur = state.cur;
+      const x = (i % cur.cols) * cur.cw, y = Math.floor(i / cur.cols) * cur.ch;
+      // 存成小 canvas 再进 parts，这样 dump 时 toDataURL 对两种来源都成立
+      const mini = document.createElement('canvas');
+      mini.width = cur.cw; mini.height = cur.ch;
+      mini.getContext('2d').drawImage(im, 0, 0, im.width, im.height, 0, 0, cur.cw, cur.ch);
+      cur.ctx.drawImage(mini, x, y, cur.cw, cur.ch);
+      if (i % cur.cols !== 0) {
+        cur.ctx.fillStyle = 'rgba(0,0,0,0.55)'; cur.ctx.fillRect(x, y, 1, cur.ch);
+        cur.ctx.fillStyle = 'rgba(255,255,255,0.45)'; cur.ctx.fillRect(x + 1, y, 1, cur.ch);
+      }
+      if (i >= cur.cols) {
+        cur.ctx.fillStyle = 'rgba(0,0,0,0.55)'; cur.ctx.fillRect(x, y, cur.cw, 1);
+        cur.ctx.fillStyle = 'rgba(255,255,255,0.45)'; cur.ctx.fillRect(x, y + 1, cur.cw, 1);
+      }
+      const prevT = cur.times.length ? cur.times[cur.times.length - 1] : null;
+      const t2 = Number((saved.times && saved.times[i]) || 0);
+      state.drawLabel(cur.ctx, x, y, cur.cw, cur.ch, state.labelFor(t2, prevT), i + 1);
+      cur.n += 1;
+      cur.times.push(t2);
+      cur.parts.push(mini);
+    }
+    return state.cur ? state.cur.n : 0;
+  };
+
   window.__fishEye = state;
   return { ok: true, reused: false };
 })()`;
@@ -617,7 +710,9 @@ async function connect() {
   const list = await fetch(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(2000) })
     .then((r) => r.json()).catch(() => null);
   if (!Array.isArray(list)) return null;
-  const page = list.find((t) => t.type === 'page' && /bilibili\.com\/video/.test(String(t.url || '')));
+  // 2026-11-26：番剧（bangumi/play/ep...）也算播放页。原来只认 /video/，
+  // 看《奇巧计程车》这种番剧时找不到标签，脚本 0.1 秒就退出、报「没有可用的播放页」。
+  const page = list.find((t) => t.type === 'page' && /bilibili\.com\/(video|bangumi\/play)/.test(String(t.url || '')));
   if (!page?.webSocketDebuggerUrl) return null;
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((res, rej) => {
@@ -696,6 +791,27 @@ function saveStrip(dir, bv, strip) {
   const dir = path.join(FRAME_ROOT, result.bv);
   fs.mkdirSync(dir, { recursive: true });
   touchHeartbeat(result.bv);   // 先摸一下，别让守护在开跑前就把视频掐了
+
+  // ── 接力：把上次没拼满的那几帧填回格子（2026-11-26 递送原则）────────────
+  // 同一个 BV 才接得上（换片天然分目录）；这次从比上次攒到的地方更早看起
+  // （往回跳 > 5 秒 = 重看了），旧帧就作废，否则时间顺序会反。
+  const pendingPath = path.join(dir, 'pending.json');
+  try {
+    if (fs.existsSync(pendingPath)) {
+      const saved = JSON.parse(fs.readFileSync(pendingPath, 'utf8'));
+      const lastT = Number(saved.lastT) || 0;
+      const nowT = Number(result.from) || 0;
+      if (lastT > 0 && nowT + 5 < lastT) {
+        fs.unlinkSync(pendingPath);
+        log(`接力作废：这次从 ${nowT}s 看起，比上次攒到 ${lastT}s 更早（往回跳了）`);
+      } else {
+        const loaded = await c.eval(`window.__fishEye && window.__fishEye.preload ? window.__fishEye.preload(${JSON.stringify(saved)}) : 0`, 25000);
+        const n = Number(loaded?.value) || 0;
+        if (n > 0) { result.resumed = n; log(`接力上了：上次攒的 ${n} 帧填回格子`); }
+        try { fs.unlinkSync(pendingPath); } catch {}
+      }
+    }
+  } catch (e) { log(`接力读取失败：${e?.message ?? e}`); }
 
   const deadline = startedAt + seconds * 1000;
   const forceGapMs = forceGapSec * 1000;
@@ -784,10 +900,37 @@ function saveStrip(dir, bv, strip) {
     await sleep(Math.min(beat, remain));
   }
 
-  const tail = await c.eval('window.__fishEye && window.__fishEye.tail ? window.__fishEye.tail() : null', 20000);
-  if (!tail.err && tail.value?.url) {
-    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch, tail.value.repacked);
+  // ── 收尾：先把待定那一帧贴进去，再看这一张满没满（递送原则）──────────────
+  // 最后抓到的那一帧还在 state.pending 里等窗口定稿，不 commit 就直接 dump 会漏掉它
+  // （第一次实测就漏了：抓到 3 帧只存下 2 帧）。所以先 commit 再判断。
+  const fin = await c.eval(`(() => {
+    const s = window.__fishEye;
+    if (!s) return null;
+    const c = s.commit();
+    if (c && c.grid) return { full: true, grid: c.grid, times: c.times, cols: c.cols, rows: c.rows, cw: c.cw, ch: c.ch };
+    return { full: false };
+  })()`, 30000);
+  const full = fin && !fin.err ? fin.value : null;
+
+  if (full && full.full) {
+    // 这一下刚好拼满一张：它本身就是成品，不用留 pending，也别再出半张
+    const saved = saveGrid(dir, result.bv, 'tail', full.grid, full.times, false, full.cols, full.rows, full.cw, full.ch, false);
     if (saved) result.grids.push(saved);
+  } else {
+    // 没满：照旧给半张图（她眼下有东西看），同时把这几帧存着，下一批抓到的往上填
+    const dumpTail = await c.eval('window.__fishEye && window.__fishEye.dump ? window.__fishEye.dump() : null', 30000);
+    const carry = dumpTail && !dumpTail.err ? dumpTail.value : null;
+    const tail = await c.eval('window.__fishEye && window.__fishEye.tail ? window.__fishEye.tail() : null', 20000);
+    if (!tail.err && tail.value?.url) {
+      const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch, tail.value.repacked);
+      if (saved) result.grids.push(saved);
+    }
+    if (carry && Array.isArray(carry.parts) && carry.parts.length) {
+      try {
+        fs.writeFileSync(pendingPath, JSON.stringify(carry), 'utf8');
+        result.carry = { n: carry.parts.length, per: Number(carry.per) || 9 };
+      } catch (e) { log(`接力存盘失败：${e?.message ?? e}`); }
+    }
   }
   await c.eval('try { if (window.__fishEye) window.__fishEye.ok = false } catch (e) {}', 3000);
   c.close();
