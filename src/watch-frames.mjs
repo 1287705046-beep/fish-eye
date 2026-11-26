@@ -39,6 +39,19 @@ const PORT = Number(process.env.BILI_CDP_PORT) || 9333;
 const HOME = os.homedir();
 const FRAME_ROOT = process.env.BILI_FRAME_DIR || path.join(HOME, '.cache', 'bili-watch-frames');
 const LOG_FILE = process.env.BILI_WATCH_LOG || path.join(HOME, '.cache', 'bili-watch-frames', 'guard.log');
+// 心跳：看片守护（bili-player-guard）靠它判断「还有人在看吗」。超过 25 秒没摸就把视频按暂停。
+// 2026-11-26 从运行版补过来——之前这份没有心跳，直接接 QQ 桥接会被守护反复掐。
+const WATCH_HEARTBEAT = process.env.BILI_WATCH_HEARTBEAT || path.join(FRAME_ROOT, '.watching');
+let lastBeatAt = 0;
+function touchHeartbeat(bv) {
+  const now = Date.now();
+  if (now - lastBeatAt < 1500) return;
+  lastBeatAt = now;
+  try {
+    fs.mkdirSync(path.dirname(WATCH_HEARTBEAT), { recursive: true });
+    fs.writeFileSync(WATCH_HEARTBEAT, JSON.stringify({ at: now, bv: bv || '', pid: process.pid, by: 'fish-eye' }));
+  } catch { /* 心跳写不进去也不能影响抓帧 */ }
+}
 
 function arg(name, dflt) {
   const i = process.argv.indexOf(`--${name}`);
@@ -680,6 +693,7 @@ function saveStrip(dir, bv, strip) {
 
   const dir = path.join(FRAME_ROOT, result.bv);
   fs.mkdirSync(dir, { recursive: true });
+  touchHeartbeat(result.bv);   // 先摸一下，别让守护在开跑前就把视频掐了
 
   const deadline = startedAt + seconds * 1000;
   const forceGapMs = forceGapSec * 1000;
@@ -689,6 +703,7 @@ function saveStrip(dir, bv, strip) {
   const loudTimes = [];
 
   while (Date.now() < deadline) {
+    touchHeartbeat(result.bv);
     const g = await c.eval(`window.__biliEye ? window.__biliEye.tick(${th}, ${forceGapMs}, ${loudSpike}, ${minGapMs}) : { error: "helpers-gone" }`, 12000);
 
     if (g.err || g.value?.error) {
