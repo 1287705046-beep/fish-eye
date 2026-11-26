@@ -77,9 +77,14 @@ const ADAPT_FORCE = String(arg('adapt-force', '') || '');    // 测试用：fast
 // 请求 0.2 秒只能拿到约 0.44 秒/跳，但仍然比 0.62 秒快得多。慢片完全不受影响。
 const FAST_MIN_GAP = Math.max(0, Math.min(10, Number(arg('fast-min-gap', 1)))) * 1000;
 const FAST_SCAN_MS = Math.max(80, Math.min(2000, Number(arg('fast-scan', 0.2)) * 1000));
+// 九格（2026-11-26 定，默认开）：两档都 3×3、短边 243，整图 1296×729。
+// 1920×720 送进模型会被缩到约 1300 长边，每格 433×244；九格不缩、每格 432×243 ——
+// 清晰度一样，一张多装 3 帧、字节还少两成。想退回老样子：--nine 0。
+const NINE = Number(arg('nine', 1)) !== 0;
 const PAGE_CFG = {
   adapt: ADAPT, adaptMedian: ADAPT_MED, fastCols: FAST_COLS, fastRows: FAST_ROWS,
   pickBest: PICK_BEST, bestRatio: BEST_RATIO, force: ADAPT_FORCE, fastMinGapMs: FAST_MIN_GAP,
+  nine: NINE,
 };
 // 一张图一张图往外送，调用方（模型）用 base64 塞进一条消息里，太大会被静默丢掉而 ok 还是 true。
 // 2.6MB 是实测的安全线（base64 后约 3.5MB）；六格 1920×720 一张约 140KB，到顶约 18 张。
@@ -205,6 +210,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   if (window.__biliEye && window.__biliEye.ok) return { ok: true, reused: true };
   const BCOLS = ${cols}, BROWS = ${Math.max(1, Math.round(perGrid / cols))}, CW = ${cellW}, CH = ${cellH};
   const FCOLS = ${cfg.fastCols}, FROWS = ${cfg.fastRows};
+  const NINE = ${cfg.nine ? 1 : 0};   // 两档 3×3 九格（短边 243，整图 1296×729）
   const ADAPT = ${cfg.adapt ? 1 : 0}, ADAPT_MED = ${cfg.adaptMedian}, FORCED = ${JSON.stringify(cfg.force || '')};
   const PICK_BEST = ${cfg.pickBest ? 1 : 0}, BEST_RATIO = ${cfg.bestRatio};
   const FMIN_GAP = ${cfg.fastMinGapMs || 1000};   // 快剪时的留帧间隔（毫秒）
@@ -305,31 +311,36 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
   };
   // 格子大小跟着源比例走（2026-11-25）：原来写死 640×360，竖屏 1080×1920 塞进去就被横着拉扁。
   // 现在短边固定 360、长边按源比例算：16:9 → 640×360，9:16 → 360×640；长边超 720 再整体缩。
-  state.pickCell = () => {
+  state.pickCell = (shortSide) => {
+    const ss = shortSide || 360;
     const v = document.querySelector('video');
     const vw = (v && v.videoWidth) || 16, vh = (v && v.videoHeight) || 9;
     let cw, ch;
-    if (vw >= vh) { ch = 360; cw = Math.round(360 * vw / vh); }
-    else { cw = 360; ch = Math.round(360 * vh / vw); }
+    if (vw >= vh) { ch = ss; cw = Math.round(ss * vw / vh); }
+    else { cw = ss; ch = Math.round(ss * vh / vw); }
     const lng = Math.max(cw, ch);
     if (lng > 720) { const k = 720 / lng; cw = Math.round(cw * k); ch = Math.round(ch * k); }
     return [Math.max(160, cw), Math.max(160, ch)];
   };
   state.reset = (m) => {
     if (m) state.mode = (m === 'fast' ? 'fast' : 'base');
-    const nc = state.mode === 'fast' ? FCOLS : BCOLS;
-    const nr = state.mode === 'fast' ? FROWS : BROWS;
-    const dim = state.pickCell();
+    // 九格（NINE=1，默认）两档都 3×3：慢档一张 9 帧 × 3 秒 ≈ 27 秒，一轮能覆盖更久。
+    const isFast = state.mode === 'fast';
+    const nc = NINE ? 3 : (isFast ? FCOLS : BCOLS);
+    const nr = NINE ? 3 : (isFast ? FROWS : BROWS);
+    // 九格卡在 1296 长边，正好在模型约 1300 的缩放线下面
+    const dim = state.pickCell(NINE ? 243 : 360);
     const g = document.createElement('canvas');
     g.width = dim[0] * nc;
     g.height = dim[1] * nr;
     const c = g.getContext('2d');
     c.fillStyle = '#000'; c.fillRect(0, 0, g.width, g.height);
-    state.cur = { canvas: g, ctx: c, n: 0, times: [], per: nc * nr, cols: nc, rows: nr, cw: dim[0], ch: dim[1] };
+    state.cur = { canvas: g, ctx: c, n: 0, times: [], parts: [], per: nc * nr, cols: nc, rows: nr, cw: dim[0], ch: dim[1] };
   };
   // 待定（pick-best）：先画到一张单格 canvas，窗口内可被更强的替换；窗口到了才贴进格子。
   state.beginPending = (v, t, diff) => {
-    const dim = state.pickCell();
+    // 尺寸跟着当前格子走：换档时 pending 和 cur 尺寸不一致会被拉伸
+    const dim = state.cur ? [state.cur.cw, state.cur.ch] : state.pickCell();
     const c = document.createElement('canvas');
     c.width = dim[0]; c.height = dim[1];
     c.getContext('2d').drawImage(v, 0, 0, v.videoWidth, v.videoHeight, 0, 0, dim[0], dim[1]);
@@ -344,6 +355,36 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     state.pending.swapped += 1;
     return true;
   };
+  // 秒数标签：同一秒的第二格带十分之一位（播放器缓冲追帧时两帧会落在同一秒）。
+  // 抽成纯函数，半张重排也要按「原来那一帧的时间」重烧一遍。
+  state.labelFor = (t, prevT) => {
+    const mm = String(Math.floor(t / 60)).padStart(2, '0');
+    const ss = String(Math.floor(t % 60)).padStart(2, '0');
+    const label = mm + ':' + ss;
+    if (prevT != null && Math.floor(prevT) === Math.floor(t)) return label + '.' + Math.floor((t % 1) * 10);
+    return label;
+  };
+  // 画标签。字号跟着格子大小走：竖屏格子窄，26px 会盖掉半张画面。
+  state.drawLabel = (ctx, x, y, cw, ch, label, idx) => {
+    const fz = Math.max(14, Math.round(Math.min(cw, ch) / 14));
+    ctx.font = 'bold ' + fz + 'px "Microsoft YaHei", sans-serif';
+    const tw = ctx.measureText(label).width;
+    const padX = Math.round(fz * 0.35), padY = Math.round(fz * 0.3);
+    const barH = Math.round(fz * 1.5);
+    ctx.fillStyle = 'rgba(0,0,0,0.62)';
+    ctx.fillRect(x + padX, y + padY, tw + fz * 0.8, barH);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, x + padX + Math.round(fz * 0.35), y + padY + Math.round(fz * 1.1));
+    // 序号：红底，跟时间标签分开。九格只靠秒数分不清先后，得有个 1~9 兜着。
+    if (idx) {
+      const bx = x + padX + tw + fz * 0.8 + Math.round(fz * 0.25);
+      const bw = Math.max(barH, Math.round(fz * 1.2) + (String(idx).length - 1) * Math.round(fz * 0.62));
+      ctx.fillStyle = 'rgba(200,42,42,0.92)';
+      ctx.fillRect(bx, y + padY, bw, barH);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(String(idx), bx + Math.round(fz * 0.3), y + padY + Math.round(fz * 1.1));
+    }
+  };
   // 把待定的那一帧真正贴进格子；满一张就把图交回去，并按最新变化量给下一张定档。
   state.commit = () => {
     const p = state.pending;
@@ -355,27 +396,25 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     const i2 = cur.n;
     const x = (i2 % cur.cols) * cur.cw, y = Math.floor(i2 / cur.cols) * cur.ch;
     cur.ctx.drawImage(p.canvas, x, y, cur.cw, cur.ch);
-    // 秒数标签。快剪时两格可能落在同一秒里（播放器缓冲追赶时画面时间会跑得比钟快），
-    // 那样两格都写 01:24 看着像重复——同一秒的第二格带上十分之一位。
-    // 注意：这段整个在模板字符串里，只能用字符串拼接，不能写反引号模板。
-    const mm = String(Math.floor(p.t / 60)).padStart(2, '0');
-    const ss = String(Math.floor(p.t % 60)).padStart(2, '0');
-    let label = mm + ':' + ss;
-    const prevT = cur.times.length ? cur.times[cur.times.length - 1] : null;
-    if (prevT != null && Math.floor(prevT) === Math.floor(p.t)) {
-      label = mm + ':' + ss + '.' + Math.floor((p.t % 1) * 10);
+    // 格子和格子之间画 1px 双色界线（外框不画）：白线压暗底、黑线压亮底，两种画面都分得清。
+    if (i2 % cur.cols !== 0) {
+      cur.ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      cur.ctx.fillRect(x, y, 1, cur.ch);
+      cur.ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      cur.ctx.fillRect(x + 1, y, 1, cur.ch);
     }
-    // 字号跟着格子大小走：竖屏格子窄，26px 会盖掉半张画面。
-    const fz = Math.max(14, Math.round(Math.min(cur.cw, cur.ch) / 14));
-    cur.ctx.font = 'bold ' + fz + 'px "Microsoft YaHei", sans-serif';
-    const tw = cur.ctx.measureText(label).width;
-    const padX = Math.round(fz * 0.35), padY = Math.round(fz * 0.3);
-    cur.ctx.fillStyle = 'rgba(0,0,0,0.62)';
-    cur.ctx.fillRect(x + padX, y + padY, tw + fz * 0.8, Math.round(fz * 1.5));
-    cur.ctx.fillStyle = '#fff';
-    cur.ctx.fillText(label, x + padX + Math.round(fz * 0.35), y + padY + Math.round(fz * 1.1));
+    if (i2 >= cur.cols) {
+      cur.ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      cur.ctx.fillRect(x, y, cur.cw, 1);
+      cur.ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      cur.ctx.fillRect(x, y + 1, cur.cw, 1);
+    }
+    // 秒数标签（同一秒第二格带十分之一位）+ 红底序号
+    const prevT = cur.times.length ? cur.times[cur.times.length - 1] : null;
+    state.drawLabel(cur.ctx, x, y, cur.cw, cur.ch, state.labelFor(p.t, prevT), i2 + 1);
     cur.n += 1;
     cur.times.push(p.t);
+    cur.parts.push(p.canvas);
     const info = { t: p.t, diff: p.diff, swapped: p.swapped, mode: state.mode };
     if (cur.n >= cur.per) {
       info.grid = cur.canvas.toDataURL('image/jpeg', 0.85);
@@ -521,6 +560,26 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     }
     const cur = state.cur;
     if (!cur || cur.n <= 0) return null;
+    // 半张 ≤4 帧、又是多列时，按行裁会变成 3×1 一条细缝；同尺寸重排成 2×2，每格大一倍。
+    if (cur.cols > 2 && cur.n <= 4 && cur.parts.length === cur.n) {
+      const rc = 2, rr = Math.ceil(cur.n / rc);
+      const g2 = document.createElement('canvas');
+      g2.width = cur.cw * rc;
+      g2.height = cur.ch * rr;
+      const c2 = g2.getContext('2d');
+      c2.fillStyle = '#000'; c2.fillRect(0, 0, g2.width, g2.height);
+      for (let i = 0; i < cur.n; i += 1) {
+        const px = (i % rc) * cur.cw, py = Math.floor(i / rc) * cur.ch;
+        c2.drawImage(cur.parts[i], px, py, cur.cw, cur.ch);
+        state.drawLabel(c2, px, py, cur.cw, cur.ch, state.labelFor(cur.times[i], i ? cur.times[i - 1] : null), i + 1);
+      }
+      const rp = {
+        url: g2.toDataURL('image/jpeg', 0.85), times: cur.times.slice(),
+        cols: rc, rows: rr, cw: cur.cw, ch: cur.ch, partial: true, repacked: true,
+      };
+      state.reset(state.chooseMode());
+      return rp;
+    }
     const usedRows = Math.max(1, Math.ceil(cur.n / cur.cols));
     const w = cur.cols * cur.cw, h = usedRows * cur.ch;
     let url;
@@ -557,7 +616,7 @@ async function connect() {
   return c;
 }
 
-function saveGrid(dir, bv, tag, url, times, partial, gc, gr, cwid, chei) {
+function saveGrid(dir, bv, tag, url, times, partial, gc, gr, cwid, chei, repacked) {
   try {
     const file = path.join(dir, `grid-${bv}-${tag}-${Date.now()}.jpg`);
     fs.writeFileSync(file, Buffer.from(String(url).split(',')[1], 'base64'));
@@ -565,7 +624,7 @@ function saveGrid(dir, bv, tag, url, times, partial, gc, gr, cwid, chei) {
     const cwi = Math.max(1, Number(cwid) || CELL_W), chi = Math.max(1, Number(chei) || CELL_H);
     let bytes = 0;
     try { bytes = fs.statSync(file).size; } catch {}
-    return { file, w: cwi * cc, h: chi * rr, cols: cc, rows: rr, cell: [cwi, chi], times, partial: !!partial, bytes };
+    return { file, w: cwi * cc, h: chi * rr, cols: cc, rows: rr, cell: [cwi, chi], times, partial: !!partial, bytes, repacked: !!repacked };
   } catch (e) {
     log(`写宫格失败：${e?.message ?? e}`);
     return null;
@@ -625,7 +684,7 @@ function saveStrip(dir, bv, strip) {
   const deadline = startedAt + seconds * 1000;
   const forceGapMs = forceGapSec * 1000;
   const stripFiles = [];
-  let fails = 0, skips = 0, pausedSince = 0;
+  let fails = 0, skips = 0, pausedSince = 0, lastResumeAt = 0;
   let cuts = 0, forces = 0, maxSpike = 0, swaps = 0, keptBytes = 0, lastMode = 'base';
   const loudTimes = [];
 
@@ -637,7 +696,7 @@ function saveStrip(dir, bv, strip) {
       if (fails === 1 || fails === 3) {
         const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
         if (!tail.err && tail.value?.url) {
-          const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch);
+          const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch, tail.value.repacked);
           if (saved) result.grids.push(saved);
         }
         prep = await c.eval(helpers, 8000);
@@ -650,6 +709,17 @@ function saveStrip(dir, bv, strip) {
       if (g.value.paused) {
         if (!pausedSince) pausedSince = Date.now();
         else if (Date.now() - pausedSince > 15000) { result.note = '视频暂停了，先把这段交给你'; break; }
+        else if (Date.now() - pausedSince > 1500 && Date.now() - lastResumeAt > 3000) {
+          // 看片守护/播放器自己会按暂停。先自救几回，别因为被掐一下就把整段丢了；
+          // 15 秒还接不上才收工（上面那条）。节流 3 秒，免得和守护互相抢。
+          lastResumeAt = Date.now();
+          const back = await c.eval(`(() => { const v = document.querySelector('video'); if (!v) return 'no-video'; if (!v.paused) return 'ok'; const p = v.play(); if (p && p.catch) p.catch(() => {}); return 'resumed'; })()`, 6000).catch(() => null);
+          if (back && back.value === 'resumed') {
+            result.resumes = (result.resumes || 0) + 1;
+            pausedSince = 0;
+            log(`被暂停了一次，已接上（第 ${result.resumes} 次，片内 ${g.value.t}s）`);
+          }
+        }
       } else if (skips >= 10) {
         result.note = `画面停在 ${g.value.t}s 没动（可能在缓冲，或者播放器卡住了）`;
         break;
@@ -699,7 +769,7 @@ function saveStrip(dir, bv, strip) {
 
   const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
   if (!tail.err && tail.value?.url) {
-    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch);
+    const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch, tail.value.repacked);
     if (saved) result.grids.push(saved);
   }
   await c.eval('try { if (window.__biliEye) window.__biliEye.ok = false } catch (e) {}', 3000);
