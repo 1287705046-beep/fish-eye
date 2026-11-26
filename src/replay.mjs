@@ -2,7 +2,7 @@
 // 用法：node src/replay.mjs [秒数]
 import fs from 'node:fs';
 
-const PORT = Number(process.env.BILI_CDP_PORT) || 9333;
+const PORT = Number(process.env.FISH_EYE_CDP_PORT) || 9333;
 class Cdp {
   constructor(ws) {
     this.ws = ws; this.id = 0; this.pending = new Map();

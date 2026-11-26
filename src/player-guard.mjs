@@ -10,42 +10,42 @@
  *   B 导航守卫：页面从 /video/BV... 掉走（到首页/推荐流/搜索）就导航回来，并回到离开时的秒数。
  *     换到**另一条 BV** 不算掉走——那是外部在换片，跟着它走。
  *   C 置顶：播放窗设成 TOPMOST，别的窗口压不住它（Windows 专用；以前会抓到「半张是别的窗口」）。
- *   D 框选（可选）：按 <video> 的真实位置算屏幕像素，写进 BILI_REGION_FILE，
+ *   D 框选（可选）：按 <video> 的真实位置算屏幕像素，写进 FISH_EYE_REGION_FILE，
  *     给「按矩形截图」那类工具有个准框。不设这个环境变量就整块跳过。
  *
  * 环境变量：
- *   BILI_CDP_PORT            默认 9333
- *   BILI_EDGE_PROFILE        默认 ~/.cache/bili-watch-frames/edge-profile（关窗时按这个 profile 名杀进程）
- *   BILI_REGION_FILE         可选；不设就不写框选
- *   BILI_WATCH_LOG           默认 ~/.cache/bili-watch-frames/guard.log
- *   BILI_CLOSE_AFTER_MS      播完多久关窗，默认 35000
- *   BILI_CLOSE_AFTER_PAUSED_MS  一直暂停多久关窗，默认 600000
- *   BILI_SEGMENT_MS          单段最长多久硬性停一次再接上，默认 840000（14 分钟）
+ *   FISH_EYE_CDP_PORT            默认 9333
+ *   FISH_EYE_EDGE_PROFILE        默认 ~/.cache/fish-eye/edge-profile（关窗时按这个 profile 名杀进程）
+ *   FISH_EYE_REGION_FILE         可选；不设就不写框选
+ *   FISH_EYE_WATCH_LOG           默认 ~/.cache/fish-eye/guard.log
+ *   FISH_EYE_CLOSE_AFTER_MS      播完多久关窗，默认 35000
+ *   FISH_EYE_CLOSE_AFTER_PAUSED_MS  一直暂停多久关窗，默认 600000
+ *   FISH_EYE_SEGMENT_MS          单段最长多久硬性停一次再接上，默认 840000（14 分钟）
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const PORT = Number(process.env.BILI_CDP_PORT) || 9333;
+const PORT = Number(process.env.FISH_EYE_CDP_PORT) || 9333;
 const POLL_MS = 2000;
 const HOME = os.homedir();
-const REGION_FILE = process.env.BILI_REGION_FILE || '';
-const LOG_FILE = process.env.BILI_WATCH_LOG || path.join(HOME, '.cache', 'bili-watch-frames', 'guard.log');
+const REGION_FILE = process.env.FISH_EYE_REGION_FILE || '';
+const LOG_FILE = process.env.FISH_EYE_WATCH_LOG || path.join(HOME, '.cache', 'fish-eye', 'guard.log');
 const MAX_FAILS = 5;
 // 播完多久自动关窗（默认 35 秒；两分钟太长，模型那边等不及）。换下一条时这个计时会自己清零。
-const CLOSE_AFTER_ENDED_MS = Number(process.env.BILI_CLOSE_AFTER_MS) > 0
-  ? Number(process.env.BILI_CLOSE_AFTER_MS)
+const CLOSE_AFTER_ENDED_MS = Number(process.env.FISH_EYE_CLOSE_AFTER_MS) > 0
+  ? Number(process.env.FISH_EYE_CLOSE_AFTER_MS)
   : 35_000;
 // 一直暂停着（不是播完）也关：她多半是丢下去干别的了，别让窗和浮窗一直占着
-const CLOSE_AFTER_PAUSED_MS = Number(process.env.BILI_CLOSE_AFTER_PAUSED_MS) > 0
-  ? Number(process.env.BILI_CLOSE_AFTER_PAUSED_MS)
+const CLOSE_AFTER_PAUSED_MS = Number(process.env.FISH_EYE_CLOSE_AFTER_PAUSED_MS) > 0
+  ? Number(process.env.FISH_EYE_CLOSE_AFTER_PAUSED_MS)
   : 600_000;
-const VIDEO_PROFILE = process.env.BILI_EDGE_PROFILE || path.join(HOME, '.cache', 'bili-watch-frames', 'edge-profile');
+const VIDEO_PROFILE = process.env.FISH_EYE_EDGE_PROFILE || path.join(HOME, '.cache', 'fish-eye', 'edge-profile');
 // 单段看多久硬性停一次（默认 14 分钟）。到点暂停、盖一行「这一段看完了」，
 // 3 秒后从**同一秒**重新打开同一条接着放——看的人不用做任何动作，流也不会断。
-const SEGMENT_MS = Number(process.env.BILI_SEGMENT_MS) > 0
-  ? Number(process.env.BILI_SEGMENT_MS)
+const SEGMENT_MS = Number(process.env.FISH_EYE_SEGMENT_MS) > 0
+  ? Number(process.env.FISH_EYE_SEGMENT_MS)
   : 14 * 60_000;
 
 function log(msg) {
@@ -141,7 +141,7 @@ function closePlayerWindow(reason) {
 }
 
 // ---------- D 框选 ----------
-// 可选功能：设了 BILI_REGION_FILE 才会把播放器的屏幕矩形写出去，
+// 可选功能：设了 FISH_EYE_REGION_FILE 才会把播放器的屏幕矩形写出去，
 // 给「按矩形截图」那类工具有个准框；不设就整块跳过。
 function writeRegion(region) {
   if (!REGION_FILE) return false;
@@ -201,10 +201,10 @@ async function syncRegion(cdp) {
 
 // ---------- A 播完兜底 + B 状态读回 ----------
 const INJECT = `(() => {
-  if (window.__biliEyeDone) return 'already';
+  if (window.__fishEyeDone) return 'already';
   const v = document.querySelector('video');
   if (!v) return 'no-video';
-  window.__biliEyeDone = 1;
+  window.__fishEyeDone = 1;
   const HIDE_SEL = [
     '.bpx-player-ending-wrap', '.bpx-player-ending', '.bpx-player-ending-related',
     '.bpx-player-ending-backdrop', '.bpx-player-ending-content', '.bpx-player-ending-panel',
@@ -268,7 +268,7 @@ const INJECT = `(() => {
     if (s) {
       // 真黑帧的判据：整片都黑 **并且** 几乎没有亮像素。
       // 只看平均亮度会把「黑底 + 一个小头像」那种暗场也当成转场（11-23 实测误标过）。
-      const th = Number(window.__biliEyeBlackThreshold) || 10;
+      const th = Number(window.__fishEyeBlackThreshold) || 10;
       const isBlack = s.mean < th && s.brightFrac < 0.01;
       if (isBlack) {
         if (!tag) {
@@ -299,7 +299,7 @@ const STATE = `(() => {
   return {
     href: location.href,
     hasVideo: !!v,
-    took: !!window.__biliEyeDone,
+    took: !!window.__fishEyeDone,
     playing: !!v && !v.paused && !v.ended,
     ended: !!v && v.ended && v.paused,
     time: v ? v.currentTime : 0,

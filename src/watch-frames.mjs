@@ -22,7 +22,7 @@
 //                                [--cols 2] [--rows 2] [--max-grids 20] [--bv BVxxx] [--json]
 //                                [--adapt 0|1] [--adapt-median 35] [--fast-cols 3] [--fast-rows 2]
 //                                [--pick-best 0|1] [--best-ratio 1.5] [--adapt-force fast|slow]
-// 环境变量：BILI_CDP_PORT（默认 9333）、BILI_FRAME_DIR（默认 ~/.cache/bili-watch-frames）、BILI_WATCH_LOG、
+// 环境变量：FISH_EYE_CDP_PORT（默认 9333）、FISH_EYE_FRAME_DIR（默认 ~/.cache/fish-eye）、FISH_EYE_WATCH_LOG、
 //          FISH_EYE_TUNING（参数文件，默认 ~/.dsh/see-now/watch-tuning.json）
 //
 // th / scan / force-gap / max-grids 不给就用参数文件里的值 —— 那正是设置页「陪看」调的四个数。
@@ -35,13 +35,13 @@ import { readTuning } from './tuning.mjs';
 /** 仓库根（scripts/ 就在它下面）。Node ≥22 才有 import.meta.dirname。 */
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
 const TUNING = readTuning();
-const PORT = Number(process.env.BILI_CDP_PORT) || 9333;
+const PORT = Number(process.env.FISH_EYE_CDP_PORT) || 9333;
 const HOME = os.homedir();
-const FRAME_ROOT = process.env.BILI_FRAME_DIR || path.join(HOME, '.cache', 'bili-watch-frames');
-const LOG_FILE = process.env.BILI_WATCH_LOG || path.join(HOME, '.cache', 'bili-watch-frames', 'guard.log');
+const FRAME_ROOT = process.env.FISH_EYE_FRAME_DIR || path.join(HOME, '.cache', 'fish-eye');
+const LOG_FILE = process.env.FISH_EYE_WATCH_LOG || path.join(HOME, '.cache', 'fish-eye', 'guard.log');
 // 心跳：看片守护（bili-player-guard）靠它判断「还有人在看吗」。超过 25 秒没摸就把视频按暂停。
 // 2026-11-26 从运行版补过来——之前这份没有心跳，直接接 QQ 桥接会被守护反复掐。
-const WATCH_HEARTBEAT = process.env.BILI_WATCH_HEARTBEAT || path.join(FRAME_ROOT, '.watching');
+const WATCH_HEARTBEAT = process.env.FISH_EYE_WATCH_HEARTBEAT || path.join(FRAME_ROOT, '.watching');
 let lastBeatAt = 0;
 function touchHeartbeat(bv) {
   const now = Date.now();
@@ -101,7 +101,7 @@ const PAGE_CFG = {
 };
 // 一张图一张图往外送，调用方（模型）用 base64 塞进一条消息里，太大会被静默丢掉而 ok 还是 true。
 // 2.6MB 是实测的安全线（base64 后约 3.5MB）；六格 1920×720 一张约 140KB，到顶约 18 张。
-const MAX_BYTES = Number(process.env.BILI_MAX_BYTES) > 0 ? Number(process.env.BILI_MAX_BYTES) : 2_600_000;
+const MAX_BYTES = Number(process.env.FISH_EYE_MAX_BYTES) > 0 ? Number(process.env.FISH_EYE_MAX_BYTES) : 2_600_000;
 // ── 字幕条 + OCR（2026-11-24 定稿）─────────────────────────────────────────
 // B站 大量视频的字幕是**烧在画面里**的：没有 <track>、没有 DOM、接口返回 0 条轨。
 // 做法：每 --sub-gap 秒看一眼画面底部，变了就裁一条（反色二值化，白字变黑字白底），
@@ -220,7 +220,7 @@ class Cdp {
 
 // 页面里的扫描器：缩略图打分 → 决定留不留 → 留就画进 3×2 的格子；满一张交回来，node 立刻落盘。
 const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
-  if (window.__biliEye && window.__biliEye.ok) return { ok: true, reused: true };
+  if (window.__fishEye && window.__fishEye.ok) return { ok: true, reused: true };
   const BCOLS = ${cols}, BROWS = ${Math.max(1, Math.round(perGrid / cols))}, CW = ${cellW}, CH = ${cellH};
   const FCOLS = ${cfg.fastCols}, FROWS = ${cfg.fastRows};
   const NINE = ${cfg.nine ? 1 : 0};   // 两档 3×3 九格（短边 243，整图 1296×729）
@@ -272,7 +272,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
       if (!v) return false;
       // 同一个 <video> 只能建一次 MediaElementSource（再建会抛 already connected），
       // 所以先认页面里已经有的那套，别自己再建一个。
-      const shared = window.__biliAudio;
+      const shared = window.__fishEyeAudio;
       if (shared && shared.analyser && (!shared.video || shared.video === v)) {
         state.audio = { ctx: shared.ctx, analyser: shared.analyser, buf: new Uint8Array(shared.analyser.frequencyBinCount), baseline: 0 };
         return true;
@@ -286,7 +286,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
       analyser.smoothingTimeConstant = 0.4;
       src.connect(analyser);
       analyser.connect(ctx.destination);
-      window.__biliAudio = { ctx, analyser, src, video: v };
+      window.__fishEyeAudio = { ctx, analyser, src, video: v };
       state.audio = { ctx, analyser, buf: new Uint8Array(analyser.frequencyBinCount), baseline: 0 };
       return true;
     } catch (e) {
@@ -608,7 +608,7 @@ const PAGE_HELPERS = (cols, perGrid, cellW, cellH, subGapMs, cfg) => `(() => {
     state.reset(state.chooseMode());
     return r;
   };
-  window.__biliEye = state;
+  window.__fishEye = state;
   return { ok: true, reused: false };
 })()`;
 
@@ -675,7 +675,7 @@ function saveStrip(dir, bv, strip) {
   let prep = await c.eval(helpers, 8000);
   if (prep.err) { result.note = `页面准备失败：${prep.err}`; c.close(); return emit(result); }
 
-  const meta = await c.eval('window.__biliEye ? window.__biliEye.info() : { error: "helpers-gone" }', 6000);
+  const meta = await c.eval('window.__fishEye ? window.__fishEye.info() : { error: "helpers-gone" }', 6000);
   if (meta.err || !meta.value || meta.value.error) {
     result.note = `读页面失败：${meta.err || meta.value?.error || '无返回'}`;
     c.close(); return emit(result);
@@ -685,10 +685,10 @@ function saveStrip(dir, bv, strip) {
   result.from = info.t || 0;
   if (!info.hasVideo) { result.note = '页面上没有播放器'; c.close(); return emit(result); }
 
-  await c.eval('window.__biliEye && window.__biliEye.initAudio && window.__biliEye.initAudio()', 8000);
-  const audioOk = await c.eval('!!(window.__biliEye && window.__biliEye.audio)', 5000);
+  await c.eval('window.__fishEye && window.__fishEye.initAudio && window.__fishEye.initAudio()', 8000);
+  const audioOk = await c.eval('!!(window.__fishEye && window.__fishEye.audio)', 5000);
   result.audio = !!(audioOk.value);
-  const aerr = await c.eval('window.__biliEye && window.__biliEye.audioError || \'\'', 5000);
+  const aerr = await c.eval('window.__fishEye && window.__fishEye.audioError || \'\'', 5000);
   result.audioError = String(aerr.value || '');
 
   const dir = path.join(FRAME_ROOT, result.bv);
@@ -704,18 +704,18 @@ function saveStrip(dir, bv, strip) {
 
   while (Date.now() < deadline) {
     touchHeartbeat(result.bv);
-    const g = await c.eval(`window.__biliEye ? window.__biliEye.tick(${th}, ${forceGapMs}, ${loudSpike}, ${minGapMs}) : { error: "helpers-gone" }`, 12000);
+    const g = await c.eval(`window.__fishEye ? window.__fishEye.tick(${th}, ${forceGapMs}, ${loudSpike}, ${minGapMs}) : { error: "helpers-gone" }`, 12000);
 
     if (g.err || g.value?.error) {
       fails += 1;
       if (fails === 1 || fails === 3) {
-        const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
+        const tail = await c.eval('window.__fishEye && window.__fishEye.tail ? window.__fishEye.tail() : null', 20000);
         if (!tail.err && tail.value?.url) {
           const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch, tail.value.repacked);
           if (saved) result.grids.push(saved);
         }
         prep = await c.eval(helpers, 8000);
-        await c.eval('window.__biliEye && window.__biliEye.initAudio && window.__biliEye.initAudio()', 8000);
+        await c.eval('window.__fishEye && window.__fishEye.initAudio && window.__fishEye.initAudio()', 8000);
       }
       if (fails >= 6) { result.note = `连续 ${fails} 次扫不到画面（${g.err || g.value?.error}）`; break; }
     } else if (g.value.skipped) {
@@ -782,12 +782,12 @@ function saveStrip(dir, bv, strip) {
     await sleep(Math.min(beat, remain));
   }
 
-  const tail = await c.eval('window.__biliEye && window.__biliEye.tail ? window.__biliEye.tail() : null', 20000);
+  const tail = await c.eval('window.__fishEye && window.__fishEye.tail ? window.__fishEye.tail() : null', 20000);
   if (!tail.err && tail.value?.url) {
     const saved = saveGrid(dir, result.bv, 'tail', tail.value.url, tail.value.times, true, tail.value.cols, tail.value.rows, tail.value.cw, tail.value.ch, tail.value.repacked);
     if (saved) result.grids.push(saved);
   }
-  await c.eval('try { if (window.__biliEye) window.__biliEye.ok = false } catch (e) {}', 3000);
+  await c.eval('try { if (window.__fishEye) window.__fishEye.ok = false } catch (e) {}', 3000);
   c.close();
 
   // ── 字幕条 → 文本（RapidOCR，一次性批量）────────────────────────────────

@@ -77,7 +77,7 @@ node src/watch-frames.mjs --seconds 300 --json
 node src/player-guard.mjs
 ```
 
-抓帧脚本输出到 `~/.cache/bili-watch-frames/<BV号>/grid-<BV>-<序号>-<时间戳>.jpg`，每格左上角烧着秒数。
+抓帧脚本输出到 `~/.cache/fish-eye/<BV号>/grid-<BV>-<序号>-<时间戳>.jpg`，每格左上角烧着秒数。
 
 ## 参数表
 
@@ -183,14 +183,14 @@ docs/
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `BILI_CDP_PORT` | 9333 | 浏览器调试端口 |
-| `BILI_FRAME_DIR` | `~/.cache/bili-watch-frames` | 宫格图落盘位置 |
-| `BILI_WATCH_LOG` | `<FRAME_DIR>/guard.log` | 日志 |
-| `BILI_EDGE_PROFILE` | `<FRAME_DIR>/edge-profile` | 守护关窗时按这个 profile 名杀进程 |
-| `BILI_REGION_FILE` | 空 | 设了才把播放器的屏幕矩形写出去（给按矩形截图的工具有个准框） |
-| `BILI_SEGMENT_MS` | 840000 | 单段最长多久硬性停一次再续播 |
-| `BILI_CLOSE_AFTER_MS` | 35000 | 播完多久关窗 |
-| `BILI_CLOSE_AFTER_PAUSED_MS` | 600000 | 一直暂停多久关窗 |
+| `FISH_EYE_CDP_PORT` | 9333 | 浏览器调试端口 |
+| `FISH_EYE_FRAME_DIR` | `~/.cache/fish-eye` | 宫格图落盘位置 |
+| `FISH_EYE_WATCH_LOG` | `<FRAME_DIR>/guard.log` | 日志 |
+| `FISH_EYE_EDGE_PROFILE` | `<FRAME_DIR>/edge-profile` | 守护关窗时按这个 profile 名杀进程 |
+| `FISH_EYE_REGION_FILE` | 空 | 设了才把播放器的屏幕矩形写出去（给按矩形截图的工具有个准框） |
+| `FISH_EYE_SEGMENT_MS` | 840000 | 单段最长多久硬性停一次再续播 |
+| `FISH_EYE_CLOSE_AFTER_MS` | 35000 | 播完多久关窗 |
+| `FISH_EYE_CLOSE_AFTER_PAUSED_MS` | 600000 | 一直暂停多久关窗 |
 
 ## 已知问题（没打算修）
 
@@ -254,6 +254,15 @@ docs/
 - [cortico-world-bili-watch](https://github.com/FXYXL/cortico-world-bili-watch) —— B站 陪看：开窗 + 定时观察帧 + 镜头切换 + 弹幕。
 
 区别在于定位：它们做的是"把视频分析清楚"，这里做的是"让它随着播放一帧一帧地待在那儿看"。
+
+## 致谢
+
+- [**See Now**](https://github.com/SAOS-3624/dsh-see-now) · 作者 [**SAOS-3624**](https://github.com/SAOS-3624) · Apache-2.0
+
+  「只把**画面变了**的那几帧交给模型」这个思路，是从它这里看来的——静止的屏幕几乎不花钱，动起来才给帧。
+  fish-eye 的抽帧部分按这个思路重写了一遍，代码是独立的：这里针对「陪着一起看 B站」重做了留帧判据（快慢两档）、九格拼图、半张重排和分批喂图。
+
+  挂在这里是记一笔出处，不是背书——fish-eye 由本仓库维护，问题和 See Now 作者无关。
 
 ## 为什么叫 Fish-eye
 

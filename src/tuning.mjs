@@ -10,9 +10,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-/** 参数文件。想放别处就设 FISH_EYE_TUNING（老名字 BILI_TUNING_FILE 也认）。 */
+/** 参数文件。想放别处就设 FISH_EYE_TUNING（老名字 FISH_EYE_TUNING_FILE 也认）。 */
 export const TUNING_FILE = process.env.FISH_EYE_TUNING
-  || process.env.BILI_TUNING_FILE
+  || process.env.FISH_EYE_TUNING_FILE
   || path.join(os.homedir(), '.dsh', 'see-now', 'watch-tuning.json');
 
 export const TUNING_DEFAULTS = { scan: 0.5, th: 20, forceGap: 20, maxGrids: 20 };
